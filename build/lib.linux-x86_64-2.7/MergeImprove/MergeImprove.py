@@ -6,7 +6,8 @@ Created on Oct 26, 2012
 
 import pysam #@UnresolvedImport
 import re
-import Synchronize
+import GradientChart
+import AvlTree
 import random
 import logging
 import argparse as ap
@@ -14,7 +15,12 @@ import util
 import os
 import time
 import multiprocessing
-from multiprocessing.managers import SyncManager
+from multiprocessing.managers import SyncManager, ListProxy
+
+from pylab import figure
+from pylab import bar
+from pylab import grid
+from pylab import show
 
 DESC = "A merger of genome alignments."
 VERSION = '0.0.1'
@@ -209,7 +215,7 @@ class MergeWorker(multiprocessing.Process):
         
         #used for output and debugging purposes
         count = 0
-        maxReads = None
+        maxReads = 2000000
         isMatch = True
         
         #while we have a read left to process OR if there are matched values from before, this needs to loop at least once more
@@ -1054,6 +1060,681 @@ class MergeWorker(multiprocessing.Process):
             else:
                 logger.warning('Unhandled cigar type:'+pair[0])
         '''
+    
+class MergeImprove(object):
+    
+    def __init__(self, mergerType, numProcesses):
+        if mergerType == UNION_MERGE:
+            self.mergerType = UNION_MERGE
+        elif mergerType == PILEUP_MERGE:
+            self.mergerType = PILEUP_MERGE
+            self.pileupTrees = {}
+        else:
+            self.mergerType = RANDOM_MERGE
+        
+        self.statistics = {'K':{'1':0,'2':0,'3':0},'U':{'1':0,'2':0,'3':0},'Q':{'1':0,'2':0,'3':0},'P':{'1':0,'2':0,'3':0},'R':{'1':0,'2':0,'3':0}, 'tot':{'1':0,'2':0,'3':0}}
+        
+    def saveRead(self, readToSave):
+        '''
+        @param readToSave - the read that should be added to the output
+        @param parent - 1, 2, 3, or SET; 1, 2, and 3 indicate the parent type, SET means it's already added, don't add again
+        @param out - whether you want to see output from this save or not
+        '''
+        if readToSave == None:
+            return
+        
+        #save the read
+        self.outputFile.write(readToSave)
+        
+        choice = getTag(readToSave, CHOICE_TYPE_TAG)
+        parent = getTag(readToSave, PARENT_OF_ORIGIN_TAG)
+        
+        #TODO: remove this print error
+        if parent == None or choice == None:
+            print 'ERROR'
+        else:
+            self.statistics[choice][parent] += 1
+            self.statistics['tot'][parent] += 1
+            
+            #TODO: remove this
+            #if choice == 'Q' and parent == '3':
+            #    print readToSave
+            
+        if verbosity:
+            logger.info('Saving from '+getTag(readToSave, PARENT_OF_ORIGIN_TAG)+': '+str(readToSave))
+        
+    def saveRandomPair(self, possiblePairs):
+        '''
+        @param possiblePairs - a list of possible pairs that could be saved
+        @param parent - the parent of origin for these pairs, can be SET indicating a mix of pairs that already have it set
+        '''
+        #pick a random pair
+        rv = random.randint(0, len(possiblePairs)-1)
+        
+        if len(possiblePairs) > 1:
+            #random choice
+            setTag(possiblePairs[rv][0], CHOICE_TYPE_TAG, 'R')
+            setTag(possiblePairs[rv][1], CHOICE_TYPE_TAG, 'R')
+            
+        #save the pair
+        self.saveRead(possiblePairs[rv][0])
+        self.saveRead(possiblePairs[rv][1])
+        
+        
+    def saveRandomSingle(self, possibleSingles):
+        '''
+        @param possibleSingles - a list of possible singles that could be saved
+        @param parent - the parent of origin for these singles, can be SET indicating a mix of pairs that already have it set
+        '''
+        #pick a random single and save it
+        rv = random.randint(0, len(possibleSingles)-1)
+        
+        if len(possibleSingles) > 1:
+            setTag(possibleSingles[rv], CHOICE_TYPE_TAG, 'R')
+        
+        self.saveRead(possibleSingles[rv])
+        
+    def parseReadForTree(self, readToParse):
+        #extract the chromosome ID so we know which tree to modify
+        chromId = readToParse.rname
+        
+        #make the tree if necessary
+        if not self.pileupTrees.has_key(chromId):
+            self.pileupTrees[chromId] = AvlTree.AvlTree()
+            
+        #now we have to parse the reads into regions
+        cig = readToParse.cigar
+        pos = readToParse.pos
+        
+        for pair in cig:
+            if pair[0] == 0 or pair[0] == 2:
+                #this is a match/mismatch, add the starting position, the shift and add the ending position
+                self.pileupTrees[chromId].addStart(pos)
+                pos += pair[1]
+                self.pileupTrees[chromId].addEnd(pos)
+            elif pair[0] == 1:
+                #do nothing, this is an insertion TO the ref
+                pass
+            elif pair[0] == 3:
+                #skip this region
+                pos += pair[1]
+            else:
+                logger.warning('Unhandled cigar type:'+pair[0])
+        
+    def handleSingleIdMerge(self, firstReads, secondReads):
+        '''
+        This function takes two sets of reads and attempts to pick one of the best alignments to save using region based likelihood
+        @param firstReads - the set of reads coming from the first parent
+        @param secondReads - the set of reads coming from the second parent
+        '''
+        
+        #if len(firstReads) > 0 and firstReads[0].qname == 'UNC11-SN627_0160:4:1101:2486:133373#TGACCA':
+        #dumpReads(firstReads, secondReads)
+        
+        #pair the reads using their HI tags
+        [firstPairs, firstSingles] = pairReads(firstReads, 'HI')
+        [secondPairs, secondSingles] = pairReads(secondReads, 'HI')
+        
+        #TODO: remove this later
+        if (len(firstPairs) > 0 and len(firstSingles) > 0) or (len(secondPairs) > 0 and len(secondSingles) > 0):
+            dumpReads(firstReads, secondReads)
+        
+        interestList = []
+        '''
+        interestList = ['UNC11-SN627_0160:4:1101:1181:46840#TAGCTT', 'UNC11-SN627_0160:4:1101:1181:97059#TAGCTT', 'UNC11-SN627_0160:4:1101:1181:140573#TAGCTT', 
+                        'UNC11-SN627_0160:4:1101:1181:172414#TAGCTT', 'UNC11-SN627_0160:4:1101:1182:3400#TAGCTT', 'UNC11-SN627_0160:4:1101:1184:123367#TAGCTT']
+        '''
+        
+        if len(firstReads) > 0:
+            for value in interestList:
+                if firstReads[0].qname == value:
+                    dumpReads(firstReads, secondReads)
+        
+        #combine reads but keep all of them regardless of score
+        possiblePairs = combinePairs(firstPairs, secondPairs)
+        possibleSingles = combineSingles(firstSingles, secondSingles)
+        
+        #stats re-done
+        pairLen = len(possiblePairs)
+        if pairLen == 0:
+            #this is when the two ends may be unique but there isn't a unique pair
+            for seq in possibleSingles:
+                #only true if A) there are no pairs and B) there is only one alignment for this sequence
+                if len(possibleSingles[seq]) == 1:
+                    #single end, mark union and save it
+                    setTag(possibleSingles[seq][0], CHOICE_TYPE_TAG, 'U')
+                    self.saveRead(possibleSingles[seq][0])
+                    
+                    if self.mergerType == PILEUP_MERGE:
+                        self.parseReadForTree(possibleSingles[seq][0])
+                    
+                    #clear the possible singles here so we cannot save it twice by accident
+                    possibleSingles[seq] = []
+                    
+        elif pairLen == 1 and len(possibleSingles) == 0:
+            #single pair, no singles
+            setTag(possiblePairs[0][0], CHOICE_TYPE_TAG, 'U')
+            setTag(possiblePairs[0][1], CHOICE_TYPE_TAG, 'U')
+            
+            #this can be completely solved using the union
+            self.saveRead(possiblePairs[0][0])
+            self.saveRead(possiblePairs[0][1])
+            
+            if self.mergerType == PILEUP_MERGE:
+                self.parseReadForTree(possiblePairs[0][0])
+                self.parseReadForTree(possiblePairs[0][1])
+            
+            #clear this so we cannot save it twice by accident
+            possiblePairs = []
+            
+        else:
+            #nothing unique from straight union
+            pass
+            
+        if self.mergerType == UNION_MERGE:
+            #save all pairs
+            for pair in possiblePairs:
+                setTag(pair[0], CHOICE_TYPE_TAG, 'K')
+                setTag(pair[1], CHOICE_TYPE_TAG, 'K')
+                
+                self.saveRead(pair[0])
+                self.saveRead(pair[1])
+                
+            #save all singles
+            for seq in possibleSingles:
+                for single in possibleSingles[seq]:
+                    setTag(single, CHOICE_TYPE_TAG, 'K')
+                    self.saveRead(single)
+                    
+        else:
+            #we now need to reduce the remaining reads based on quality
+            #the following functions weed out lower quality reads
+            possiblePairs = reducePairsByScore(possiblePairs)
+            possibleSingles = reduceSinglesByScore(possibleSingles)
+            
+            '''
+            if isPaired1 and isPaired2:
+                #both sets have pairs, lets attempt to blend them together
+                possiblePairs = combinePairs(firstPairs, secondPairs, False)
+            elif isPaired1:
+                #only one with pairs
+                possiblePairs = combinePairs(firstPairs, [], False)
+            elif isPaired2:
+                #only one with pairs
+                possiblePairs = combinePairs([], secondPairs, False)
+            else:
+                possibleSingles = combineSingles(firstSingles, secondSingles, False)
+                pass
+            '''
+            
+            if len(possiblePairs) > 0:
+                #if there's only one possible pair remaining, then it's a quality based match
+                if len(possiblePairs) == 1:
+                    setTag(possiblePairs[0][0], CHOICE_TYPE_TAG, 'Q')
+                    setTag(possiblePairs[0][1], CHOICE_TYPE_TAG, 'Q')
+                    
+                    self.saveRead(possiblePairs[0][0])
+                    self.saveRead(possiblePairs[0][1])
+                    
+                    if self.mergerType == PILEUP_MERGE:
+                        self.parseReadForTree(possiblePairs[0][0])
+                        self.parseReadForTree(possiblePairs[0][1])
+                        
+                else:
+                    if self.mergerType == RANDOM_MERGE:
+                        #we randomly choose a pair to keep if this is the case
+                        self.saveRandomPair(possiblePairs)
+                    
+                    elif self.mergerType == PILEUP_MERGE:
+                        #store all of the pairs remaining for sorting through later
+                        pHI = 0
+                        for pair in possiblePairs:
+                            setTag(pair[0], PILEUP_HI_TAG, pHI)
+                            setTag(pair[1], PILEUP_HI_TAG, pHI)
+                            self.tempFile.write(pair[0])
+                            self.tempFile.write(pair[1])
+                            pHI += 1
+            else:
+                #we randomly choose for each sequence a single alignment to keep
+                pHI = 0
+                for seq in possibleSingles:
+                    if len(possibleSingles[seq]) == 1:
+                        #only one option for this end of the read, save it
+                        setTag(possibleSingles[seq][0], CHOICE_TYPE_TAG, 'Q')
+                        self.saveRead(possibleSingles[seq][0])
+                        
+                        #parse the read if it's a pileup merge
+                        if self.mergerType == PILEUP_MERGE:
+                            self.parseReadForTree(possibleSingles[seq][0])
+                        
+                    elif len(possibleSingles[seq]) > 1:
+                        #multiple options for this end of the read
+                        if self.mergerType == RANDOM_MERGE:
+                            #random merge, random save
+                            self.saveRandomSingle(possibleSingles[seq])
+                        elif self.mergerType == PILEUP_MERGE:
+                            #store these alignments for pileup checking later
+                            for single in possibleSingles[seq]:
+                                setTag(single, PILEUP_HI_TAG, pHI)
+                                self.tempFile.write(single)
+                                pHI += 1
+                
+    def handlePostPileupMerge(self, reads):
+        #dumpReads(reads, [])
+        
+        avgSum = 0
+        [pairs, singles] = pairReads(reads, PILEUP_HI_TAG)
+        
+        if len(pairs) != 0:
+            bestAvgPileup = -1
+            bestPairs = []
+            
+            for pair in pairs:
+                [tot1, bases1] = self.calcPileupStats(pair[0])
+                [tot2, bases2] = self.calcPileupStats(pair[1])
+                
+                avgPileup = float(tot1+tot2)/(bases1+bases2)
+                avgSum += avgPileup
+                
+                if avgPileup > bestAvgPileup:
+                    bestAvgPileup = avgPileup
+                    bestPairs = []
+                
+                if avgPileup == bestAvgPileup:
+                    bestPairs.append(pair)
+            
+            #stats
+            if len(bestPairs) == 1:
+                setTag(bestPairs[0][0], CHOICE_TYPE_TAG, 'P')
+                setTag(bestPairs[0][1], CHOICE_TYPE_TAG, 'P')
+                
+            #save one of the best pileup pairs
+            self.saveRandomPair(bestPairs)
+            
+            if(bestAvgPileup == 0):
+                self.percentageChoice[0] += 1
+            else:
+                self.percentageChoice[int(100*bestAvgPileup/avgSum)] += 1
+            
+        else:
+            #do this over singles
+            bestAvgPileup = {}
+            bestReads = {}
+            avgSum = 0
+            
+            for read in singles:
+                #if there's nothing yet for this sequence, set it's best as -1 so it gets overwritten below
+                if not bestAvgPileup.has_key(read.seq):
+                    bestAvgPileup[read.seq] = -1
+                    bestReads[read.seq] = []
+                
+                #get the pileup calculation
+                [tot, bases] = self.calcPileupStats(read)
+                avgPileup = float(tot)/bases
+                avgSum += avgPileup
+                
+                #if it's better, keep it
+                if avgPileup > bestAvgPileup[read.seq]:
+                    bestAvgPileup[read.seq] = avgPileup
+                    bestReads[read.seq] = []
+                
+                if avgPileup == bestAvgPileup[read.seq]:    
+                    bestReads[read.seq].append(read)
+            
+            #save the best from each end
+            finAvg = 0
+            for seq in bestReads:
+                brs = bestReads[seq]
+                
+                if len(brs) == 1:
+                    setTag(brs[0], CHOICE_TYPE_TAG, 'P')
+                    
+                self.saveRandomSingle(brs)
+                finAvg += bestAvgPileup[seq]
+                
+            if finAvg == 0:
+                self.percentageChoice[0] += 1
+            else:
+                self.percentageChoice[int(100*finAvg/avgSum)] += 1
+
+    def calcPileupStats(self, read):
+        '''
+        @param read - the read we are calculating
+        @return a pair [total coverage, bases] representing the sum of all coverages over 'bases' number of base pairs
+        '''
+        total = 0
+        bases = 0
+        
+        cig = read.cigar
+        pos = read.pos
+        chrom = read.rname
+        
+        for cigTypePair in cig:
+            cigType = cigTypePair[0]
+            cigLen = cigTypePair[1]
+            
+            if cigType == 0:
+                '''
+                OLD METHOD
+                #sum up all the pileups
+                for loc in range(pos, pos+cigLen):
+                    if self.pileupTrees.has_key(chrom):
+                        total += self.pileupTrees[chrom].getPileupHeight(loc)
+                '''
+                if self.pileupTrees.has_key(chrom):
+                    total += self.pileupTrees[chrom].getTotalPileupHeight(pos, pos+cigLen-1)
+                
+                #modify the bases and position
+                bases += cigLen
+                pos += cigLen
+                
+            elif cigType == 1:
+                #insertion to the reference
+                #no change to position, these will be ignored bases though
+                pass
+            elif cigType == 2:
+                #deletion to the reference
+                #modify position by the second value
+                pos += cigLen
+            elif cigType == 3:
+                #skipped region
+                #modify the position by the second value
+                pos += cigLen
+            else:
+                print 'UNHANDLED CIG TYPE:'+cigType
+                
+        return [total, bases]
+    
+    def mergeAnnotatedBamFiles(self, firstFilename, secondFilename, outputFilename):
+        '''
+        This is the main function that should be called by an outside entity to perform a merge
+        @param firstFilename - the name of the file that holds the first parent's alignments
+        @param secondFilename - the name of the file that holds the second parent's alignments
+        @param outputFilename - the name of the destination file for saving the merge results
+        '''
+        
+        random.seed()
+        
+        #attempt to open both bam files for merging
+        firstFile = pysam.Samfile(firstFilename, 'rb')
+        secondFile = pysam.Samfile(secondFilename, 'rb')
+        
+        #TODO: samfile open checks
+        
+        #open the output file as well
+        self.outputFile = pysam.Samfile(outputFilename, 'wb', template=firstFile)
+        
+        if self.mergerType == PILEUP_MERGE:
+            self.tempFN = outputFilename+'.tmp.bam'
+            self.tempFile = pysam.Samfile(self.tempFN, 'wb', template=firstFile)
+        
+        #TODO: update headers?
+        #print firstFile.header
+        
+        #start with no qname
+        currentQname = None
+        
+        #get the first read ID from each file
+        firstRead = firstFile.next()
+        firstQname = firstRead.qname
+        firstFlags = firstRead.flag
+        
+        secondRead = secondFile.next()
+        secondQname = secondRead.qname
+        secondFlags = secondRead.flag
+        
+        #pick the 'lowest' or first qname
+        if isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname)):
+            currentQname = firstQname
+        else:
+            currentQname = secondQname
+        
+        #this is stat gathering items
+        pairingsDictionary = {}
+        pairingRep = [0, 0]
+        pairingRep2 = [0, 0]
+        firstPairingSeq = None
+        firstReads = []
+        secondReads = []
+        
+        #used for output and debugging purposes
+        count = 0
+        maxReads = None
+        isMatch = True
+        
+        #while we have a read left to process OR if there are matched values from before, this needs to loop at least once more
+        while firstRead != None or secondRead != None or isMatch:
+            #used for breaking if we need to, strictly for debug purposes
+            if maxReads != None and count > maxReads:
+                break
+            
+            #default there is no match
+            isMatch = False
+            
+            #check if the first one has a match, if so increment it and get the next read
+            while firstQname == currentQname and firstQname != None:
+                #always append the read
+                firstReads.append(firstRead)
+                
+                #check if we should 'count' it
+                if isFlagSet(firstFlags, MULTIPLE_SEGMENT_FLAG) and \
+                   (isFlagSet(firstFlags, BOTH_ALIGNED_FLAG) or not isFlagSet(firstFlags, OTHER_UNMAPPED_FLAG)) and \
+                   not isFlagSet(firstFlags, FIRST_SEGMENT_FLAG):
+                    #if it has multiple segments, both are aligned, and this isn't the first segment, don't count it
+                    pass
+                else:
+                    #count it
+                    if firstPairingSeq == None:
+                        firstPairingSeq = firstRead.seq
+                        
+                    if firstRead.seq == firstPairingSeq:
+                        pairingRep[0] += 1
+                    else:
+                        pairingRep2[0] += 1
+                        
+                #get the next one for analysis
+                try:
+                    firstRead = firstFile.next()
+                    firstQname = firstRead.qname
+                    firstFlags = firstRead.flag
+                except:
+                    firstRead = None
+                    firstQname = None
+                    firstFlags = None
+                    
+                isMatch = True
+                
+            #check the second also and get the next read if needed
+            while secondQname == currentQname and secondQname != None:
+                #always append the read
+                secondReads.append(secondRead)
+                
+                #check if we should 'count' it
+                if isFlagSet(secondFlags, MULTIPLE_SEGMENT_FLAG) and \
+                   (isFlagSet(secondFlags, BOTH_ALIGNED_FLAG) or not isFlagSet(secondFlags, OTHER_UNMAPPED_FLAG)) and \
+                   not isFlagSet(secondFlags, FIRST_SEGMENT_FLAG):
+                    #if it has multiple segments, both are aligned, and this isn't the first segment, don't count it
+                    pass
+                else:
+                    #count it
+                    if firstPairingSeq == None:
+                        firstPairingSeq = secondRead.seq
+                        
+                    if secondRead.seq == firstPairingSeq:
+                        pairingRep[1] += 1
+                    else:
+                        pairingRep2[1] += 1
+                    
+                #get the next one for analysis
+                try:
+                    secondRead = secondFile.next()
+                    secondQname = secondRead.qname
+                    secondFlags = secondRead.flag
+                except:
+                    secondRead = None
+                    secondQname = None
+                    secondFlags = None
+                    
+                isMatch = True
+                
+            #check if there are no reads matching the current qname
+            if not isMatch:
+                
+                #debug statement every 1m counts (a count is not directly correlated to read counts)
+                if count % 100000 == 0:
+                    logger.info('[Master] Processed '+str(count)+' read names...')
+                    
+                #increment the count always when we update the qname
+                count += 1
+                
+                #no match, time for the next qname after storing the data
+                if not pairingsDictionary.has_key(pairingRep[0]):
+                    pairingsDictionary[pairingRep[0]] = {}
+                
+                if not pairingsDictionary.has_key(pairingRep2[0]):
+                    pairingsDictionary[pairingRep2[0]] = {}
+                
+                if not pairingsDictionary[pairingRep[0]].has_key(pairingRep[1]):
+                    pairingsDictionary[pairingRep[0]][pairingRep[1]] = 0
+                
+                if not pairingsDictionary[pairingRep2[0]].has_key(pairingRep2[1]):
+                    pairingsDictionary[pairingRep2[0]][pairingRep2[1]] = 0
+                
+                #increment the number of values with that pair type by 1, stats gathering info 
+                pairingsDictionary[pairingRep[0]][pairingRep[1]] += 1
+                
+                if pairingRep2[0] != 0 or pairingRep2[1] != 0:
+                    pairingsDictionary[pairingRep2[0]][pairingRep2[1]] += 1
+                    
+                #pick from the reads which ones make the most sense
+                self.handleSingleIdMerge(firstReads, secondReads)
+                
+                #reset the pairing
+                pairingRep = [0, 0]
+                pairingRep2 = [0, 0]
+                firstPairingSeq = None
+                firstReads = []
+                secondReads = []
+                
+                #get the next qname
+                if firstQname != None and (secondQname == None or isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname))):
+                    currentQname = firstQname
+                elif secondQname != None:
+                    currentQname = secondQname
+        
+        
+        if self.mergerType == PILEUP_MERGE:
+            logger.info("Beginning post pileup merge process...")
+            
+            #close the file, any discrepancies are added already
+            self.tempFile.close()
+            
+            #open the file for reading now
+            self.percentageChoice = [0 for x in range(0, 101)]
+            self.tempFile = pysam.Samfile(self.tempFN, 'rb')
+            
+            #run through the extras in the temp file
+            try:
+                read = self.tempFile.next()
+                readQname = read.qname
+            except:
+                read = None
+                readQname = None
+            
+            #init
+            currentQname = readQname
+            isMatch = False
+            readsInSet = []
+            
+            #main loop to get all the reads
+            while read != None or isMatch:
+                isMatch = False
+                
+                while readQname == currentQname and readQname != None:
+                    #append the read
+                    readsInSet.append(read)
+                    isMatch = True
+                    
+                    #see if you can get another
+                    try:
+                        read = self.tempFile.next()
+                        readQname = read.qname
+                    except:
+                        read = None
+                        readQname = None
+                
+                #now we have all the reads with the same name
+                if not isMatch:
+                    #magic to handle the set
+                    self.handlePostPileupMerge(readsInSet)
+                    
+                    #reset these
+                    readsInSet = []
+                    currentQname = readQname
+            
+            #close and remove file from system
+            self.tempFile.close()
+            os.remove(self.tempFN)
+        
+        #close the files
+        firstFile.close()
+        secondFile.close()
+        self.outputFile.close()
+        
+        return pairingsDictionary
+    
+    def showChoiceChart(self):
+        if self.mergerType == PILEUP_MERGE:
+            logger.info('Generating pileup dominance percentage chart')
+            figure(1)
+            xaxis = [x for x in range(0, len(self.percentageChoice))]
+            bar(xaxis, self.percentageChoice)
+            grid(True)
+            show()
+
+    def dumpStats(self):
+        logger.info('Statistics:')
+        logger.info('Parent of Origin\t|\t   Mother|\t   Father|\t  Unknown| Total')
+        width = 15
+        POorder= ['1', '2', '3']
+        
+        if self.mergerType == UNION_MERGE:
+            CTOrder = ['U', 'K', 'tot']
+        elif self.mergerType == RANDOM_MERGE:
+            CTOrder = ['U', 'Q', 'R', 'tot']
+        elif self.mergerType == PILEUP_MERGE:
+            CTOrder = ['U', 'Q', 'P', 'R', 'tot']
+            
+        for part in CTOrder:
+            if part == 'U':
+                out = 'Union\t\t'
+            elif part == 'K':
+                out = 'Kept-all\t\t'
+            elif part == 'Q':
+                out = 'Quality\t\t'
+            elif part == 'P':
+                out = 'Pileup\t\t'
+            elif part == 'R':
+                out = 'Random\t\t'
+            elif part == 'tot':
+                out = 'Total\t\t'
+            else:
+                pass
+            
+            tot = 0
+            for parent in POorder:
+                out += '|'
+                if parent == '1':
+                    out += ' '
+                    
+                val = str(self.statistics[part][parent])
+                tot += self.statistics[part][parent]
+                for x in range(0, width-len(val)):
+                    out += ' '
+                out += val
+            
+            out += '| '+str(tot)
+            logger.info(out)
             
 def splitSingles(singles):
     '''
@@ -1734,8 +2415,8 @@ def mainRun():
     #TreeManager.register('getPileupHeight', AvlTree.getPH)
     #TreeManager.register('getTotalPileupHeight', AvlTree.getTotalPH)
     #TreeManager.register('getTreeKeys', AvlTree.getTreeKeys, ListProxy)
-    TreeManager.register('numPastStage', Synchronize.numPastStage)
-    TreeManager.register('finishedStage', Synchronize.finishedStage)
+    TreeManager.register('numPastStage', AvlTree.numPastStage)
+    TreeManager.register('finishedStage', AvlTree.finishedStage)
     
     manager = TreeManager()
     manager.start()

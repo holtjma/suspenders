@@ -1,0 +1,6 @@
+#! /bin/env python 
+
+from MergeImprove import MergeImprove
+
+if __name__ == '__main__':
+	MergeImprove.mainRun()
