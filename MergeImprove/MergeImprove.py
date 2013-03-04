@@ -17,8 +17,8 @@ import multiprocessing
 from multiprocessing.managers import SyncManager
 
 DESC = "A merger of genome alignments."
-VERSION = '0.0.1'
-PKG_VERSION = '0.0.1'
+VERSION = '0.1.1'
+PKG_VERSION = '0.1.1'
 
 #constant flags from the sam specs
 MULTIPLE_SEGMENT_FLAG = 1 << 0 #0x01
@@ -209,7 +209,7 @@ class MergeWorker(multiprocessing.Process):
         
         #used for output and debugging purposes
         count = 0
-        maxReads = None
+        maxReads = None#4000000 #TODO: change before upload
         isMatch = True
         
         #while we have a read left to process OR if there are matched values from before, this needs to loop at least once more
@@ -398,24 +398,25 @@ class MergeWorker(multiprocessing.Process):
         #mark that we're done and barrier sync
         self.finishAndBarrierSync(QUALITY_STAGE)
         
-        #master needs to merge the pileup files, sort, and index them
-        logger.info('[Master] Merging '+str(self.numProcs)+' pileup files...')
-        
-        mergeArgs = ['-f', self.baseOutputFN+'.tmp.pileup_all.bam']
+        if self.mergerType == PILEUP_MERGE:
+            #master needs to merge the pileup files, sort, and index them
+            logger.info('[Master] Merging '+str(self.numProcs)+' pileup files...')
             
-        for i in range(0, self.numProcs):
-            mergeArgs.append(self.baseOutputFN+'.tmp'+str(i)+'.pileup.sorted.bam')
+            mergeArgs = ['-f', self.baseOutputFN+'.tmp.pileup_all.bam']
+                
+            for i in range(0, self.numProcs):
+                mergeArgs.append(self.baseOutputFN+'.tmp'+str(i)+'.pileup.sorted.bam')
+            
+            pysam.merge(*mergeArgs)
+            
+            #logger.info('[Master] Sorting pileup file for searching...')
+            
+            #pysam.sort(self.baseOutputFN+'.tmp.pileup_all.bam', self.baseOutputFN+'.tmp.pileup_all.sorted')
+            
+            logger.info('[Master] Creating index for pileup file...')
+            
+            pysam.index(self.baseOutputFN+'.tmp.pileup_all.bam')
         
-        pysam.merge(*mergeArgs)
-        
-        #logger.info('[Master] Sorting pileup file for searching...')
-        
-        #pysam.sort(self.baseOutputFN+'.tmp.pileup_all.bam', self.baseOutputFN+'.tmp.pileup_all.sorted')
-        
-        logger.info('[Master] Creating index for pileup file...')
-        
-        pysam.index(self.baseOutputFN+'.tmp.pileup_all.bam')
-    
         #mark that we're done and barrier sync
         self.finishAndBarrierSync(PRE_PILEUP_STAGE)
         
