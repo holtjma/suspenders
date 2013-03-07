@@ -5,7 +5,6 @@ Created on Oct 26, 2012
 '''
 
 import pysam #@UnresolvedImport
-import re
 import Synchronize
 import random
 import logging
@@ -17,13 +16,13 @@ import multiprocessing
 from multiprocessing.managers import SyncManager
 
 DESC = "A merger of genome alignments."
-VERSION = '0.1.1'
-PKG_VERSION = '0.1.1'
+VERSION = '0.1.2'
+PKG_VERSION = '0.1.2'
 
 #constant flags from the sam specs
 MULTIPLE_SEGMENT_FLAG = 1 << 0 #0x01
-BOTH_ALIGNED_FLAG = 1 << 1#0x02
-#SEGMENT_UNMAPPED_FLAG = 1 << 2#through testing, this flag was never used
+#BOTH_ALIGNED_FLAG = 1 << 1#0x02
+SEGMENT_UNMAPPED_FLAG = 1 << 2#through testing, this flag was never used
 OTHER_UNMAPPED_FLAG = 1 << 3#0x08, for all our reads, this SHOULD be (not BOTH_ALIGNED_FLAG)
 FIRST_SEGMENT_FLAG = 1 << 6#0x40
 #SECOND_SEGMENT_FLAG = 1 << 7#0x80
@@ -76,15 +75,6 @@ P_IN_TAG = 'pi'
 P_DEL_TAG = 'pd'
 
 verbosity = False
-
-#pileupTrees = {}
-#treeDictLock = threading.Lock()
-
-#manager = AvlTree.TreeManager()
-#manager.start()
-#treeDictLock = manager.Lock()
-#treeLocks = manager.dict()
-#pileupTrees = manager.dict() 
 
 class MergeWorker(multiprocessing.Process):
     
@@ -186,23 +176,16 @@ class MergeWorker(multiprocessing.Process):
         #get the first read ID from each file
         firstRead = firstFile.next()
         firstQname = firstRead.qname
-        firstFlags = firstRead.flag
         
         secondRead = secondFile.next()
         secondQname = secondRead.qname
-        secondFlags = secondRead.flag
         
         #pick the 'lowest' or first qname
-        if isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname)):
+        #if isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname)):
+        if isQnameBefore(firstQname, secondQname):
             currentQname = firstQname
         else:
             currentQname = secondQname
-        
-        #this is stat gathering items
-        pairingsDictionary = {}
-        pairingRep = [0, 0]
-        pairingRep2 = [0, 0]
-        firstPairingSeq = None
         
         firstReads = []
         secondReads = []
@@ -225,33 +208,14 @@ class MergeWorker(multiprocessing.Process):
             while firstQname == currentQname and firstQname != None:
                 #always append the read
                 firstReads.append(firstRead)
-                #TODO: handle cases of unmapped reads, there is a flag for this
-                #check if we should 'count' it
-                if isFlagSet(firstFlags, MULTIPLE_SEGMENT_FLAG) and \
-                   (isFlagSet(firstFlags, BOTH_ALIGNED_FLAG) or not isFlagSet(firstFlags, OTHER_UNMAPPED_FLAG)) and \
-                   not isFlagSet(firstFlags, FIRST_SEGMENT_FLAG):
-                    #if it has multiple segments, both are aligned, and this isn't the first segment, don't count it
-                    pass
-                else:
-                    #count it
-                    if firstPairingSeq == None:
-                        firstPairingSeq = firstRead.seq
-                        
-                    if firstRead.seq == firstPairingSeq:
-                        pairingRep[0] += 1
-                    else:
-                        pairingRep2[0] += 1
-                        
+                
                 #get the next one for analysis
                 try:
                     firstRead = firstFile.next()
                     firstQname = firstRead.qname
-                    firstFlags = firstRead.flag
-                    
                 except:
                     firstRead = None
                     firstQname = None
-                    firstFlags = None
                     
                 isMatch = True
                 
@@ -260,31 +224,13 @@ class MergeWorker(multiprocessing.Process):
                 #always append the read
                 secondReads.append(secondRead)
                 
-                #check if we should 'count' it
-                if isFlagSet(secondFlags, MULTIPLE_SEGMENT_FLAG) and \
-                   (isFlagSet(secondFlags, BOTH_ALIGNED_FLAG) or not isFlagSet(secondFlags, OTHER_UNMAPPED_FLAG)) and \
-                   not isFlagSet(secondFlags, FIRST_SEGMENT_FLAG):
-                    #if it has multiple segments, both are aligned, and this isn't the first segment, don't count it
-                    pass
-                else:
-                    #count it
-                    if firstPairingSeq == None:
-                        firstPairingSeq = secondRead.seq
-                        
-                    if secondRead.seq == firstPairingSeq:
-                        pairingRep[1] += 1
-                    else:
-                        pairingRep2[1] += 1
-                    
                 #get the next one for analysis
                 try:
                     secondRead = secondFile.next()
                     secondQname = secondRead.qname
-                    secondFlags = secondRead.flag
                 except:
                     secondRead = None
                     secondQname = None
-                    secondFlags = None
                     
                 isMatch = True
                 
@@ -298,25 +244,6 @@ class MergeWorker(multiprocessing.Process):
                 #increment the count always when we update the qname
                 count += 1
                 
-                #no match, time for the next qname after storing the data
-                if not pairingsDictionary.has_key(pairingRep[0]):
-                    pairingsDictionary[pairingRep[0]] = {}
-                
-                if not pairingsDictionary.has_key(pairingRep2[0]):
-                    pairingsDictionary[pairingRep2[0]] = {}
-                
-                if not pairingsDictionary[pairingRep[0]].has_key(pairingRep[1]):
-                    pairingsDictionary[pairingRep[0]][pairingRep[1]] = 0
-                
-                if not pairingsDictionary[pairingRep2[0]].has_key(pairingRep2[1]):
-                    pairingsDictionary[pairingRep2[0]][pairingRep2[1]] = 0
-                
-                #increment the number of values with that pair type by 1, stats gathering info 
-                pairingsDictionary[pairingRep[0]][pairingRep[1]] += 1
-                
-                if pairingRep2[0] != 0 or pairingRep2[1] != 0:
-                    pairingsDictionary[pairingRep2[0]][pairingRep2[1]] += 1
-                    
                 #pick from the reads which ones make the most sense
                 #self.handleSingleIdMerge(firstReads, secondReads)
                 #self.readsQueue.put([firstReads, secondReads])
@@ -364,14 +291,12 @@ class MergeWorker(multiprocessing.Process):
                 #    self.readsQueue.put(currentQname)
                 
                 #reset the pairing
-                pairingRep = [0, 0]
-                pairingRep2 = [0, 0]
-                firstPairingSeq = None
                 firstReads = []
                 secondReads = []
                 
                 #get the next qname
-                if firstQname != None and (secondQname == None or isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname))):
+                #if firstQname != None and (secondQname == None or isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname))):
+                if firstQname != None and (secondQname == None or isQnameBefore(firstQname, secondQname)):
                     currentQname = firstQname
                 else:
                     currentQname = secondQname
@@ -446,8 +371,6 @@ class MergeWorker(multiprocessing.Process):
         
         logger.info('[0] Finished!')
         self.resultsQueue.put(self.statistics)
-        
-        return pairingsDictionary
     
     def emptyMergeQueue(self):
         
@@ -496,7 +419,8 @@ class MergeWorker(multiprocessing.Process):
                 endQname = qnames[1]
                 
                 #skip all reads before the start qname in the first file
-                while firstRead != None and isQnameBefore(re.split(':|#', firstQname), re.split(':|#', startQname)):
+                #while firstRead != None and isQnameBefore(re.split(':|#', firstQname), re.split(':|#', startQname)):
+                while firstRead != None and isQnameBefore(firstQname, startQname):
                     try:
                         firstRead = firstFile.next()
                         firstQname = firstRead.qname
@@ -505,7 +429,8 @@ class MergeWorker(multiprocessing.Process):
                         firstQname = None
                 
                 #skip all reads before the start qname in the second file
-                while secondRead != None and isQnameBefore(re.split(':|#', secondQname), re.split(':|#', startQname)):
+                #while secondRead != None and isQnameBefore(re.split(':|#', secondQname), re.split(':|#', startQname)):
+                while secondRead != None and isQnameBefore(secondQname, startQname):
                     try:
                         secondRead = secondFile.next()
                         secondQname = secondRead.qname
@@ -517,13 +442,15 @@ class MergeWorker(multiprocessing.Process):
                     currentQname = secondQname
                 elif secondRead == None:
                     currentQname = firstQname
-                elif isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname)):
+                #elif isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname)):
+                elif isQnameBefore(firstQname, secondQname):
                     currentQname = firstQname
                 else:
                     currentQname = secondQname
                 
                 #while we have a current qname AND (that qname is before the end of the block or is at the end of the block)
-                while currentQname != None and (isQnameBefore(re.split(':|#', currentQname), re.split(':|#', endQname)) or currentQname == endQname):
+                #while currentQname != None and (isQnameBefore(re.split(':|#', currentQname), re.split(':|#', endQname)) or currentQname == endQname):
+                while currentQname != None and (isQnameBefore(currentQname, endQname) or currentQname == endQname):
                     #each round through this loop is a new set of first and second reads
                     firstReads = []
                     secondReads = []
@@ -557,7 +484,8 @@ class MergeWorker(multiprocessing.Process):
                         currentQname = secondQname
                     elif secondRead == None:
                         currentQname = firstQname
-                    elif isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname)):
+                    #elif isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname)):
+                    elif isQnameBefore(firstQname, secondQname):
                         currentQname = firstQname
                     else:
                         currentQname = secondQname
@@ -608,7 +536,10 @@ class MergeWorker(multiprocessing.Process):
         '''
         
         #if len(firstReads) > 0 and firstReads[0].qname == 'UNC11-SN627_0160:4:1101:2486:133373#TGACCA':
-        #dumpReads(firstReads, secondReads)
+        if verbosity:
+            dumpReads(firstReads, secondReads)
+        
+        #import pydevd;pydevd.settrace()
         
         #pair the reads using their HI tags
         [firstPairs, firstSingles] = pairReads(firstReads, 'HI')
@@ -618,17 +549,16 @@ class MergeWorker(multiprocessing.Process):
         if (len(firstPairs) > 0 and len(firstSingles) > 0) or (len(secondPairs) > 0 and len(secondSingles) > 0):
             dumpReads(firstReads, secondReads)
         
-        interestList = []
         '''
+        interestList = []
         interestList = ['UNC11-SN627_0160:4:1101:1181:46840#TAGCTT', 'UNC11-SN627_0160:4:1101:1181:97059#TAGCTT', 'UNC11-SN627_0160:4:1101:1181:140573#TAGCTT', 
                         'UNC11-SN627_0160:4:1101:1181:172414#TAGCTT', 'UNC11-SN627_0160:4:1101:1182:3400#TAGCTT', 'UNC11-SN627_0160:4:1101:1184:123367#TAGCTT']
-        '''
         
         if len(firstReads) > 0:
             for value in interestList:
                 if firstReads[0].qname == value:
                     dumpReads(firstReads, secondReads)
-        
+        '''
         #combine reads but keep all of them regardless of score
         possiblePairs = combinePairs(firstPairs, secondPairs)
         possibleSingles = combineSingles(firstSingles, secondSingles)
@@ -1055,40 +985,6 @@ class MergeWorker(multiprocessing.Process):
             else:
                 logger.warning('Unhandled cigar type:'+pair[0])
         '''
-            
-def splitSingles(singles):
-    '''
-    @param singles - the set of unpaired reads from a parent
-    @return - two separate lists of values such that the reads are grouped based on the sequence they aligned two
-    '''
-    #init
-    firstSeq = None
-    firstSet = []
-    
-    secondSeq = None
-    secondSet = []
-    
-    #time to split the singles up
-    for read in singles:
-        #if there isn't a first sequence, mark this one as the first
-        if firstSeq == None:
-            firstSeq = read.seq
-            firstSet.append(read)
-        
-        #if they are equal append to list
-        elif firstSeq == read.seq:
-            firstSet.append(read)
-            
-        #not part of the first, so check if we have a second, then add it to second
-        elif secondSeq == None:
-            secondSeq = read.seq
-            secondSet.append(read)
-        else:
-            secondSet.append(read)
-    
-    #return the first list and the second list
-    return [firstSet, secondSet]
-
 
 def calculatePairScore(readPair):
     '''
@@ -1247,10 +1143,13 @@ def pairReads(reads, pairTag):
     singles = []
     readsLookup = {}
     
+    #TODO: if THIS segment is unmapped, we should remove it from any return value
+    
     #iterate through the reads
     for read in reads:
         if isFlagSet(read.flag, MULTIPLE_SEGMENT_FLAG):
-            if isFlagSet(read.flag, BOTH_ALIGNED_FLAG):
+            #if isFlagSet(read.flag, BOTH_ALIGNED_FLAG):
+            if not isFlagSet(read.flag, OTHER_UNMAPPED_FLAG):
                 #this is a read that is paired and both ends aligned
                 #get the hiTag
                 hiTag = getTag(read, pairTag)
@@ -1505,12 +1404,18 @@ def combineSingles(singles1, singles2):
             if score1 == score2:
                 #set the PO tag
                 setTag(s1, PARENT_OF_ORIGIN_TAG, '3')
-                
+                isFirstSegment = isFlagSet(s1.flag, FIRST_SEGMENT_FLAG)
+                '''
                 if not uniqueSingles.has_key(s1.seq):
                     uniqueSingles[s1.seq] = []
                 uniqueSingles[s1.seq].append(s1)
+                '''
+                if not uniqueSingles.has_key(isFirstSegment):
+                    uniqueSingles[isFirstSegment] = []
+                uniqueSingles[isFirstSegment].append(s1)
                 
             else:
+                '''
                 if not uniqueSingles.has_key(s1.seq):
                     uniqueSingles[s1.seq] = []
                 
@@ -1520,10 +1425,22 @@ def combineSingles(singles1, singles2):
                 
                 setTag(s2, PARENT_OF_ORIGIN_TAG, '2')
                 uniqueSingles[s2.seq].append(s2)
+                '''
+                isFirstSegment = isFlagSet(s1.flag, FIRST_SEGMENT_FLAG)
+                if not uniqueSingles.has_key(isFirstSegment):
+                    uniqueSingles[isFirstSegment] = []
+                
+                #different so keep both around
+                setTag(s1, PARENT_OF_ORIGIN_TAG, '1')
+                uniqueSingles[isFirstSegment].append(s1)
+                
+                setTag(s2, PARENT_OF_ORIGIN_TAG, '2')
+                uniqueSingles[isFirstSegment].append(s2)
             
             singles2.remove(s2)
             
         else:
+            '''
             if not uniqueSingles.has_key(s1.seq):
                 uniqueSingles[s1.seq] = []
             
@@ -1531,8 +1448,19 @@ def combineSingles(singles1, singles2):
             setTag(s1, PARENT_OF_ORIGIN_TAG, '1')
             setTag(s1, YA_TAG, '1')
             uniqueSingles[s1.seq].append(s1)
-        
+            '''
+            isFirstSegment = isFlagSet(s1.flag, FIRST_SEGMENT_FLAG)
+            if not uniqueSingles.has_key(isFirstSegment):
+                uniqueSingles[isFirstSegment] = []
+            
+            #no match, mark it as such
+            setTag(s1, PARENT_OF_ORIGIN_TAG, '1')
+            setTag(s1, YA_TAG, '1')
+            uniqueSingles[isFirstSegment].append(s1)
+            
+            
     for s2 in singles2:
+        '''
         if not uniqueSingles.has_key(s2.seq):
             uniqueSingles[s2.seq] = []
 
@@ -1540,6 +1468,15 @@ def combineSingles(singles1, singles2):
         setTag(s2, PARENT_OF_ORIGIN_TAG, '2')
         setTag(s2, YA_TAG, '2')
         uniqueSingles[s2.seq].append(s2)
+        '''
+        isFirstSegment = isFlagSet(s2.flag, FIRST_SEGMENT_FLAG)
+        if not uniqueSingles.has_key(isFirstSegment):
+            uniqueSingles[isFirstSegment] = []
+
+        #add anything leftover here
+        setTag(s2, PARENT_OF_ORIGIN_TAG, '2')
+        setTag(s2, YA_TAG, '2')
+        uniqueSingles[isFirstSegment].append(s2)
     
     return uniqueSingles
     
@@ -1590,12 +1527,15 @@ def isFlagSet(value, FLAG):
     else:
         return True
 
+'''
 def isQnameBefore(qnameArray1, qnameArray2):
-    '''
-    @param qnameArray1 - the array version of the first qname split along the ':'
-    @param qnameArray2 - the array version of the second qname split along the ':'
-    @return - True if qnameArray1 comes before qnameArray2
-    '''
+'''
+'''
+@param qnameArray1 - the array version of the first qname split along the ':'
+@param qnameArray2 - the array version of the second qname split along the ':'
+@return - True if qnameArray1 comes before qnameArray2
+'''
+'''
     
     if len(qnameArray2) == 0:
         return False
@@ -1612,7 +1552,74 @@ def isQnameBefore(qnameArray1, qnameArray2):
         return int(qnameArray1[0]) < int(qnameArray2[0])
     else:
         return qnameArray1[0] < qnameArray2[0]
+'''
 
+def isQnameBefore(qname1, qname2):
+    '''
+    @param qname1 - the first qname
+    @param qname2 - the second qname
+    @return - True if qname1 comes before qname2
+    '''
+    ret = None
+    
+    if qname2 == None:
+        ret = False
+    
+    if qname1 == None:
+        ret = True
+    
+    pos1 = 0
+    pos2 = 0
+    
+    num1 = 0
+    num2 = 0
+    
+    #print qname1+' <? '+qname2
+    
+    while ret == None and pos1 < len(qname1) and pos2 < len(qname2):
+        isNumerical = False
+        
+        #pull out any and all consecutive digits
+        num1 = 0
+        while pos1 < len(qname1) and qname1[pos1].isdigit():
+            num1 = num1*10+int(qname1[pos1])
+            pos1 += 1
+            isNumerical = True
+        
+        num2 = 0
+        while pos2 < len(qname2) and qname2[pos2].isdigit():
+            num2 = num2*10+int(qname2[pos2])
+            pos2 += 1
+            isNumerical = True
+        
+        if isNumerical:
+            #compare those numbers
+            if num1 < num2:
+                ret = True
+            elif num1 > num2:
+                ret = False
+            else:
+                #identical
+                pass
+        else:
+            #looking at normal letters/symbols
+            if qname1[pos1] < qname2[pos2]:
+                ret = True
+            elif qname1[pos1] > qname2[pos2]:
+                ret = False
+            else:
+                #identical
+                pos1 += 1
+                pos2 += 1
+                pass
+    
+    if ret == None:
+        #identical
+        ret = False
+    
+    #print ret
+    return ret
+        
 def isPositionSame(read1, read2):
     '''
     @param read1 - the first read to check
@@ -1629,7 +1636,9 @@ def isPositionSame(read1, read2):
         return False
     
     #finally, compare
-    if read1.seq == read2.seq and read1.rname == read2.rname and read1.pos == read2.pos:
+    #if read1.seq == read2.seq and read1.rname == read2.rname and read1.pos == read2.pos:
+    #same segment, same chrom, same pos
+    if isFlagSet(read1.flag, FIRST_SEGMENT_FLAG) == isFlagSet(read2.flag, FIRST_SEGMENT_FLAG) and read1.rname == read2.rname and read1.pos == read2.pos:
         #now check the cigars
         cig1 = read1.cigar
         cig2 = read2.cigar
@@ -1682,6 +1691,9 @@ def mainRun():
     group.add_argument('-s', '--quality', dest='mergeType', action='store_const', const=RANDOM_MERGE, help='merge the files using the quality score, then randomly choosing (default)', default=RANDOM_MERGE)
     group.add_argument('-t', '--pileup', dest='mergeType', action='store_const', const=PILEUP_MERGE, help='merge the files using the quality score, then the pileup heights, then randomly choosing', default=RANDOM_MERGE)
     
+    #TODO: do more than just affect the end merge files
+    p.add_argument('-k', '--keep-temp', dest='keepTemp', action='store_true', help='keep all temporary files on the file system', default=False)
+    
     #optional argument
     #p.add_argument('-c', dest='showChart', action='store_true', help='show distribution chart (default: no)')
     #p.add_argument('-v', dest='verbose', action='store_true', help='verbose (default: no)')
@@ -1718,7 +1730,7 @@ def mainRun():
     readsQueue = multiprocessing.Queue()
     resultsQueue = multiprocessing.Queue()
     
-    max_queue_size = multiprocessing.Value('i', 100)
+    max_queue_size = multiprocessing.Value('i', 100*args.numProcesses)
     #pileupTrees = {}
     
     #create a merger
@@ -1770,16 +1782,20 @@ def mainRun():
         if args.numProcesses > 1:
             logger.info('Merging '+str(args.numProcesses)+' result files...')
             
-            mergeArgs = ['-f', args.outMergedBam]
+            #TODO: this causes problems if a file is empty, add a fix?
+            mergeArgs = ['-fn', args.outMergedBam]
             
             for i in range(0, args.numProcesses):
                 mergeArgs.append(args.outMergedBam+'.tmp'+str(i)+'.bam')
             
             pysam.merge(*mergeArgs)
+            #print pysam.__version__
+            #pysam.merge('-nf', args.outMergedBam, args.outMergedBam+'.tmp0.bam', args.outMergedBam+'.tmp1.bam')
             
-            logger.info('Cleaning up...')
-            for i in range(0, args.numProcesses):
-                os.remove(args.outMergedBam+'.tmp'+str(i)+'.bam')
+            if not args.keepTemp:
+                logger.info('Cleaning up...')
+                for i in range(0, args.numProcesses):
+                    os.remove(args.outMergedBam+'.tmp'+str(i)+'.bam')
             
             logger.info('Merge complete!')
             
