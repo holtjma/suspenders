@@ -1,7 +1,7 @@
 '''
 Created on Oct 26, 2012
 
-@author: holtjma@cs.unc.edu
+@author: James Holt
 '''
 
 import pysam #@UnresolvedImport
@@ -11,18 +11,19 @@ import logging
 import argparse as ap
 import util
 import os
+import re
 import time
 import multiprocessing
 from multiprocessing.managers import SyncManager
 
 DESC = "A merger of genome alignments."
-VERSION = '0.1.2'
-PKG_VERSION = '0.1.2'
+VERSION = '0.1.3'
+PKG_VERSION = '0.1.3'
 
 #constant flags from the sam specs
 MULTIPLE_SEGMENT_FLAG = 1 << 0 #0x01
 #BOTH_ALIGNED_FLAG = 1 << 1#0x02
-SEGMENT_UNMAPPED_FLAG = 1 << 2#through testing, this flag was never used
+SEGMENT_UNMAPPED_FLAG = 1 << 2#0x04
 OTHER_UNMAPPED_FLAG = 1 << 3#0x08, for all our reads, this SHOULD be (not BOTH_ALIGNED_FLAG)
 FIRST_SEGMENT_FLAG = 1 << 6#0x40
 #SECOND_SEGMENT_FLAG = 1 << 7#0x80
@@ -74,15 +75,36 @@ P_SNP_TAG = 'ps'
 P_IN_TAG = 'pi'
 P_DEL_TAG = 'pd'
 
+#constants for the clusters
+MAX_CLUSTER_SIZE = 100
+
 verbosity = False
 
 class MergeWorker(multiprocessing.Process):
     
     def __init__(self, readsQueue, resultsQueue, isMaster, firstFilename, secondFilename, outputFilename, mergerType, managerAddress, numProcs, workerID, max_queue_size):
+        '''
+        @param readsQueue - the shared queue where the master will place indicators for the workers to decide what they should process
+        @param resultsQueue - the shared queue for storing statistics on the alignments from each worker
+        @param isMaster - boolean, indicates if this process is the master or not
+        @param firstFilename - the first fn to be merged
+        @param secondFilename - the second fn to be merged
+        @param outputFilename - the overall output filename where the final merge will be, worker won't use this unless a single process scenario
+        @param mergerType - union, quality, pileup are the types offered right now
+        @param managerAddress - address so that we can connect and access synchronization primitives
+        @param numProcs - number of processes
+        @param workerID - integer ID, 0 means master
+        @param max_queue_size - mostly for the master to tell it how large the queue can get up to
+        '''
         multiprocessing.Process.__init__(self)
         
         #always get these stats
-        self.statistics = {'K':{'1':0,'2':0,'3':0},'U':{'1':0,'2':0,'3':0},'Q':{'1':0,'2':0,'3':0},'P':{'1':0,'2':0,'3':0},'R':{'1':0,'2':0,'3':0}, 'tot':{'1':0,'2':0,'3':0}}
+        self.statistics = {'K':{'1':0,'2':0,'3':0},
+                           'U':{'1':0,'2':0,'3':0},
+                           'Q':{'1':0,'2':0,'3':0},
+                           'P':{'1':0,'2':0,'3':0},
+                           'R':{'1':0,'2':0,'3':0},
+                           'tot':{'1':0,'2':0,'3':0}}
         
         #save the inputs from the init
         self.readsQueue = readsQueue
@@ -91,7 +113,16 @@ class MergeWorker(multiprocessing.Process):
         self.firstFilename = firstFilename
         self.secondFilename = secondFilename
         self.baseOutputFN = outputFilename
-        self.outputFilename = outputFilename+'.tmp'+str(workerID)+'.bam'
+        
+        if numProcs > 1:
+            self.outputFilename = outputFilename+'.tmp'+str(workerID)+'.bam'
+            self.isSingleProcess = False
+        elif isMaster:
+            self.outputFilename = outputFilename
+            self.isSingleProcess = True
+        else:
+            logger.error('Created non-master process with only 1 process allowed')
+        
         self.pileupTempPrefix = outputFilename+'.tmp'+str(workerID)+'.pileup'
         self.numProcs = numProcs
         self.workerID = workerID
@@ -107,18 +138,13 @@ class MergeWorker(multiprocessing.Process):
         self.stage = QUALITY_STAGE
         
         #finally start our own manager
-        class LocalTreeManager(SyncManager):
+        class LocalSynchronyManager(SyncManager):
             pass
         
-        LocalTreeManager.register('updateTree')
-        LocalTreeManager.register('inorder')
-        LocalTreeManager.register('getPileupHeight')
-        LocalTreeManager.register('getTotalPileupHeight')
-        LocalTreeManager.register('getTreeKeys')
-        LocalTreeManager.register('numPastStage')
-        LocalTreeManager.register('finishedStage')
+        LocalSynchronyManager.register('numPastStage')
+        LocalSynchronyManager.register('finishedStage')
         
-        self.ltm = LocalTreeManager(managerAddress)
+        self.ltm = LocalSynchronyManager(managerAddress)
         self.ltm.connect()
 
     def finishAndBarrierSync(self, stage):
@@ -132,6 +158,9 @@ class MergeWorker(multiprocessing.Process):
         #once we get here we know everything is at or past this stage
         
     def run(self):
+        '''
+        required since it's a process
+        '''
         if self.isMaster:
             self.fillMergeQueue()
         else:
@@ -168,20 +197,22 @@ class MergeWorker(multiprocessing.Process):
         
         #start with no qname
         currentQname = None
-        MAX_CLUSTER_SIZE = 100
         currClusterSize = 0
         clusterStart = None
         clusterEnd = None
         
         #get the first read ID from each file
+        firstTell = firstFile.tell()
         firstRead = firstFile.next()
         firstQname = firstRead.qname
         
+        secondTell = secondFile.tell()
         secondRead = secondFile.next()
         secondQname = secondRead.qname
         
+        clusterStarts = [firstTell, secondTell]
+        
         #pick the 'lowest' or first qname
-        #if isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname)):
         if isQnameBefore(firstQname, secondQname):
             currentQname = firstQname
         else:
@@ -192,7 +223,7 @@ class MergeWorker(multiprocessing.Process):
         
         #used for output and debugging purposes
         count = 0
-        maxReads = None#4000000 #TODO: change before upload
+        maxReads = None
         isMatch = True
         
         #while we have a read left to process OR if there are matched values from before, this needs to loop at least once more
@@ -211,6 +242,7 @@ class MergeWorker(multiprocessing.Process):
                 
                 #get the next one for analysis
                 try:
+                    firstTell = firstFile.tell()
                     firstRead = firstFile.next()
                     firstQname = firstRead.qname
                 except:
@@ -226,6 +258,7 @@ class MergeWorker(multiprocessing.Process):
                 
                 #get the next one for analysis
                 try:
+                    secondTell = secondFile.tell()
                     secondRead = secondFile.next()
                     secondQname = secondRead.qname
                 except:
@@ -244,58 +277,62 @@ class MergeWorker(multiprocessing.Process):
                 #increment the count always when we update the qname
                 count += 1
                 
-                #pick from the reads which ones make the most sense
-                #self.handleSingleIdMerge(firstReads, secondReads)
-                #self.readsQueue.put([firstReads, secondReads])
-                #self.readsQueue.put([firstReads, ["c", "d"]])
-                
-                #if we have no start, make the start this name
-                if clusterStart == None:
-                    clusterStart = currentQname
+                if self.isSingleProcess:
+                    #only a single process, us, handle it here
+                    self.handleSingleIdMerge(firstReads, secondReads)
+                else:
+                    #handling multi-process 
+                    #if we have no start, make the start this name
+                    if clusterStart == None:
+                        clusterStart = currentQname
+                        
+                    #if we are within the boundaries, extend the cluster
+                    if currClusterSize < MAX_CLUSTER_SIZE and currentQname != None:
+                        clusterEnd = currentQname
+                        currClusterSize += 1
                     
-                #if we are within the boundaries, extend the cluster
-                if currClusterSize < MAX_CLUSTER_SIZE and currentQname != None:
-                    clusterEnd = currentQname
-                    currClusterSize += 1
-                
-                if currClusterSize == MAX_CLUSTER_SIZE:
-                    #the cluster is ready for submission
-                    #check if the queue has space
-                    if self.readsQueue.qsize() >= self.maxQueueSize.value:
-                        #no space in the queue
-                        if clusterEnd == currentQname:
-                            #we just added this to the very end AND we know the cluster is full, so we shouldn't process it
-                            pass
+                    if currClusterSize == MAX_CLUSTER_SIZE:
+                        #the cluster is ready for submission
+                        #check if the queue has space
+                        if self.readsQueue.qsize() >= self.maxQueueSize.value:
+                            #no space in the queue
+                            if clusterEnd == currentQname:
+                                #we just added this to the very end AND we know the cluster is full, so we shouldn't process it
+                                pass
+                            else:
+                                #cluster is full, BUT this wasn't added to the end
+                                self.handleSingleIdMerge(firstReads, secondReads)
                         else:
-                            #cluster is full, BUT this wasn't added to the end
-                            self.handleSingleIdMerge(firstReads, secondReads)
-                    else:
-                        #full cluster and space to submit, so do so
-                        self.readsQueue.put([clusterStart, clusterEnd])
+                            #full cluster and space to submit, so do so
+                            #self.readsQueue.put([clusterStart, clusterEnd])
+                            self.readsQueue.put(clusterStarts)
+                            clusterStarts = [firstTell, secondTell]
                             
-                        #there is space in the queue
-                        if clusterEnd == currentQname:
-                            #we just added this to the end of the cluster AND we know the cluster is full, send it to be processed
-                            #reset
-                            clusterStart = None
-                            clusterEnd = None
-                            currClusterSize = 0
-                        else:
-                            #we should restart the cluster with this extra read
-                            clusterStart = currentQname
-                            clusterEnd = currentQname
-                            currClusterSize = 1
-                            
-                    
-                #else:
-                #    self.readsQueue.put(currentQname)
-                
+                            #there is space in the queue
+                            if clusterEnd == currentQname:
+                                #we just added this to the end of the cluster AND we know the cluster is full, send it to be processed
+                                #reset
+                                clusterStart = None
+                                clusterEnd = None
+                                currClusterSize = 0
+                            else:
+                                self.handleSingleIdMerge(firstReads, secondReads)
+                                
+                                clusterStart = None
+                                clusterEnd = None
+                                currClusterSize = 0
+                                
+                                '''
+                                #we should restart the cluster with this extra read
+                                clusterStart = currentQname
+                                clusterEnd = currentQname
+                                currClusterSize = 1
+                                '''
                 #reset the pairing
                 firstReads = []
                 secondReads = []
                 
                 #get the next qname
-                #if firstQname != None and (secondQname == None or isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname))):
                 if firstQname != None and (secondQname == None or isQnameBefore(firstQname, secondQname)):
                     currentQname = firstQname
                 else:
@@ -303,7 +340,8 @@ class MergeWorker(multiprocessing.Process):
         
         if clusterStart != None:
             #remainder cluster, put it on 
-            self.readsQueue.put([clusterStart, clusterEnd])
+            #self.readsQueue.put([clusterStart, clusterEnd])
+            self.readsQueue.put(clusterStarts)
             
             #reset, just in case
             clusterStart = None
@@ -334,10 +372,6 @@ class MergeWorker(multiprocessing.Process):
             
             pysam.merge(*mergeArgs)
             
-            #logger.info('[Master] Sorting pileup file for searching...')
-            
-            #pysam.sort(self.baseOutputFN+'.tmp.pileup_all.bam', self.baseOutputFN+'.tmp.pileup_all.sorted')
-            
             logger.info('[Master] Creating index for pileup file...')
             
             pysam.index(self.baseOutputFN+'.tmp.pileup_all.bam')
@@ -363,17 +397,13 @@ class MergeWorker(multiprocessing.Process):
         secondFile.close()
         self.outputFile.close()
         
-        '''
-        treekeys = self.ltm.getTreeKeys()
-        for treeId in treekeys:
-            print str(treeId)+':'+str(self.ltm.inorder(treeId))
-        '''
-        
         logger.info('[0] Finished!')
         self.resultsQueue.put(self.statistics)
     
     def emptyMergeQueue(self):
-        
+        '''
+        This is executed by non-master worker processes
+        '''
         random.seed()
         
         #attempt to open both bam files for merging
@@ -415,11 +445,29 @@ class MergeWorker(multiprocessing.Process):
                 self.stage = PILEUP_STAGE
             else:
                 
+                #move to the relevant points in our files
+                firstFile.seek(qnames[0])
+                secondFile.seek(qnames[1])
+                
+                try:
+                    firstRead = firstFile.next()
+                    firstQname = firstRead.qname
+                except:
+                    firstRead = None
+                    firstQname = None
+                    
+                try:
+                    secondRead = secondFile.next()
+                    secondQname = secondRead.qname
+                except:
+                    secondRead = None
+                    secondQname = None
+                
+                '''
                 startQname = qnames[0]
                 endQname = qnames[1]
                 
                 #skip all reads before the start qname in the first file
-                #while firstRead != None and isQnameBefore(re.split(':|#', firstQname), re.split(':|#', startQname)):
                 while firstRead != None and isQnameBefore(firstQname, startQname):
                     try:
                         firstRead = firstFile.next()
@@ -429,7 +477,6 @@ class MergeWorker(multiprocessing.Process):
                         firstQname = None
                 
                 #skip all reads before the start qname in the second file
-                #while secondRead != None and isQnameBefore(re.split(':|#', secondQname), re.split(':|#', startQname)):
                 while secondRead != None and isQnameBefore(secondQname, startQname):
                     try:
                         secondRead = secondFile.next()
@@ -437,20 +484,21 @@ class MergeWorker(multiprocessing.Process):
                     except:
                         secondRead = None
                         secondQname = None
+                '''
                 
                 if firstRead == None:
                     currentQname = secondQname
                 elif secondRead == None:
                     currentQname = firstQname
-                #elif isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname)):
                 elif isQnameBefore(firstQname, secondQname):
                     currentQname = firstQname
                 else:
                     currentQname = secondQname
                 
                 #while we have a current qname AND (that qname is before the end of the block or is at the end of the block)
-                #while currentQname != None and (isQnameBefore(re.split(':|#', currentQname), re.split(':|#', endQname)) or currentQname == endQname):
-                while currentQname != None and (isQnameBefore(currentQname, endQname) or currentQname == endQname):
+                #while currentQname != None and (isQnameBefore(currentQname, endQname) or currentQname == endQname):
+                numProcessed = 0
+                while currentQname != None and numProcessed < MAX_CLUSTER_SIZE:
                     #each round through this loop is a new set of first and second reads
                     firstReads = []
                     secondReads = []
@@ -478,13 +526,13 @@ class MergeWorker(multiprocessing.Process):
                 
                     #merge the two sets
                     self.handleSingleIdMerge(firstReads, secondReads)
+                    numProcessed += 1
                     
                     #get the next qname
                     if firstRead == None:
                         currentQname = secondQname
                     elif secondRead == None:
                         currentQname = firstQname
-                    #elif isQnameBefore(re.split(':|#', firstQname), re.split(':|#', secondQname)):
                     elif isQnameBefore(firstQname, secondQname):
                         currentQname = firstQname
                     else:
@@ -518,12 +566,6 @@ class MergeWorker(multiprocessing.Process):
         
         self.outputFile.close()
         
-        '''
-        treekeys = self.ltm.getTreeKeys()
-        for treeId in treekeys:
-            print str(treeId)+':'+str(self.ltm.inorder(treeId))
-        '''
-        
         logger.info('['+str(self.workerID)+'] Finished!')
         
         self.resultsQueue.put(self.statistics)
@@ -534,8 +576,6 @@ class MergeWorker(multiprocessing.Process):
         @param firstReads - the set of reads coming from the first parent
         @param secondReads - the set of reads coming from the second parent
         '''
-        
-        #if len(firstReads) > 0 and firstReads[0].qname == 'UNC11-SN627_0160:4:1101:2486:133373#TGACCA':
         if verbosity:
             dumpReads(firstReads, secondReads)
         
@@ -549,16 +589,6 @@ class MergeWorker(multiprocessing.Process):
         if (len(firstPairs) > 0 and len(firstSingles) > 0) or (len(secondPairs) > 0 and len(secondSingles) > 0):
             dumpReads(firstReads, secondReads)
         
-        '''
-        interestList = []
-        interestList = ['UNC11-SN627_0160:4:1101:1181:46840#TAGCTT', 'UNC11-SN627_0160:4:1101:1181:97059#TAGCTT', 'UNC11-SN627_0160:4:1101:1181:140573#TAGCTT', 
-                        'UNC11-SN627_0160:4:1101:1181:172414#TAGCTT', 'UNC11-SN627_0160:4:1101:1182:3400#TAGCTT', 'UNC11-SN627_0160:4:1101:1184:123367#TAGCTT']
-        
-        if len(firstReads) > 0:
-            for value in interestList:
-                if firstReads[0].qname == value:
-                    dumpReads(firstReads, secondReads)
-        '''
         #combine reads but keep all of them regardless of score
         possiblePairs = combinePairs(firstPairs, secondPairs)
         possibleSingles = combineSingles(firstSingles, secondSingles)
@@ -575,8 +605,6 @@ class MergeWorker(multiprocessing.Process):
                     self.saveRead(possibleSingles[seq][0])
                     
                     if self.mergerType == PILEUP_MERGE:
-                        #import pydevd;pydevd.settrace()
-        
                         self.parseReadForTree(possibleSingles[seq][0])
                     
                     #clear the possible singles here so we cannot save it twice by accident
@@ -676,6 +704,11 @@ class MergeWorker(multiprocessing.Process):
                                 pHI += 1
     
     def prepareForPileup(self):
+        '''
+        Executed when done processing the first pass of reads from quality scores, basically sort our data so we can merge and 
+        build the pileup heights
+        '''
+        
         #close the file that has the reads for the pileup calculations
         self.pileupTempFile.close()
         
@@ -684,14 +717,11 @@ class MergeWorker(multiprocessing.Process):
         #sort the current output file into normal positional sort
         pysam.sort(self.pileupTempPrefix+'.bam', self.pileupTempPrefix+'.sorted')
         
-        #logger.info('['+str(self.workerID)+'] Building the pileup index...')
-        
-        #build the index for the file
-        #pysam.index(self.pileupTempPrefix+'.sorted.bam')
-        
-        #logger.info('['+str(self.workerID)+'] Pileup data complete.  Waiting for other processes...')
-        
     def startPileupAnalysis(self):
+        '''
+        Begin handling pileup data
+        TODO: this is mostly incomplete or too slow right now, needs a rework
+        '''
         logger.info('['+str(self.workerID)+'] Beginning post pileup merge process...')
         
         #close the file, any discrepancies are added already
@@ -701,10 +731,6 @@ class MergeWorker(multiprocessing.Process):
         #TODO: remove this?
         self.percentageChoice = [0 for x in range(0, 101)]
         self.tempFile = pysam.Samfile(self.tempFN, 'rb')
-        
-        #self.pileupFiles = []
-        #for wid in range(0, self.numProcs):
-        #    self.pileupFiles.append(pysam.Samfile(self.baseOutputFN+'.tmp'+str(wid)+'.pileup.sorted.bam', 'rb'))
         
         self.pileupFile = pysam.Samfile(self.baseOutputFN+'.tmp.pileup_all.bam', 'rb')
         
@@ -758,8 +784,10 @@ class MergeWorker(multiprocessing.Process):
         logger.info('['+str(self.workerID)+'] Finished post pileup merge process.  Waiting for other processes...')
     
     def handlePostPileupMerge(self, reads):
-        #dumpReads(reads, [])
-        
+        '''
+        This function compares a group of alignments and decides which one to keep
+        @param reads - a set of reads with the same name to be compared using pileup
+        '''
         avgSum = 0
         [pairs, singles] = pairReads(reads, PILEUP_HI_TAG)
         
@@ -886,6 +914,9 @@ class MergeWorker(multiprocessing.Process):
         return [total, bases]
         
     def cleanUpFiles(self):
+        '''
+        this function removes the temporary files from doing the pileup calculations
+        '''
         if self.mergerType == PILEUP_MERGE:
             #remove all the extra pileup files
             os.remove(self.baseOutputFN+'.tmp'+str(self.workerID)+'.pileup.bam')
@@ -895,6 +926,7 @@ class MergeWorker(multiprocessing.Process):
             if self.isMaster:
                 os.remove(self.baseOutputFN+'.tmp.pileup_all.bam')
                 os.remove(self.baseOutputFN+'.tmp.pileup_all.bam.bai')
+                
     def saveRead(self, readToSave):
         '''
         @param readToSave - the read that should be added to the output
@@ -914,12 +946,12 @@ class MergeWorker(multiprocessing.Process):
         if parent == None or choice == None:
             print 'ERROR:'+str(readToSave)
         else:
-            self.statistics[choice][parent] += 1
-            self.statistics['tot'][parent] += 1
-            
-            #TODO: remove this
-            #if choice == 'Q' and parent == '3':
-            #    print readToSave
+            if self.statistics.has_key(choice) and self.statistics[choice].has_key(parent):
+                self.statistics[choice][parent] += 1
+                self.statistics['tot'][parent] += 1
+            else:
+                print 'Poorly structured tag:'
+                print readToSave
             
         if verbosity:
             logger.info('Saving from '+getTag(readToSave, PARENT_OF_ORIGIN_TAG)+': '+str(readToSave))
@@ -956,35 +988,14 @@ class MergeWorker(multiprocessing.Process):
         self.saveRead(possibleSingles[rv])
     
     def parseReadForTree(self, readToParse):
+        '''
+        @param readToParse - the read we want to save as part of the pileup calculations later
+        '''
         if readToParse == None:
             return
         
         #save the read
         self.pileupTempFile.write(readToParse)
-        
-        '''
-        #extract the chromosome ID so we know which tree to modify
-        chromId = readToParse.rname
-        
-        #now we have to parse the reads into regions
-        cig = readToParse.cigar
-        pos = readToParse.pos
-        
-        for pair in cig:
-            if pair[0] == 0 or pair[0] == 2:
-                #this is a match/mismatch, add the starting position, the shift and add the ending position
-                success = self.ltm.updateTree(chromId, pos, True)
-                pos += pair[1]
-                success = self.ltm.updateTree(chromId, pos, False)
-            elif pair[0] == 1:
-                #do nothing, this is an insertion TO the ref
-                pass
-            elif pair[0] == 3:
-                #skip this region
-                pos += pair[1]
-            else:
-                logger.warning('Unhandled cigar type:'+pair[0])
-        '''
 
 def calculatePairScore(readPair):
     '''
@@ -1028,6 +1039,7 @@ def calculateScore(cigar, editDistance):
         return 0
     
     #scoring constants as gathered from the bowtie website
+    #TODO: make these user-configurable
     MATCH = 2
     MISMATCH = -6
     GAP_OPEN = -5
@@ -1069,7 +1081,7 @@ def calculateScore(cigar, editDistance):
             
             #unhandled type
             else:
-                logger.warning('Unhandled Cigar string type:'+symbol)
+                logger.warning('Unhandled cigar string type:'+symbol)
             
             #reset these values
             number = ''
@@ -1089,7 +1101,6 @@ def getTag(read, tag):
     @param tag - the tag type, 'OM', 'OC', etc.
     @return - the tag from read or None if that tag isn't found
     '''
-    
     #make sure we have a read
     if read == None:
         return None
@@ -1111,6 +1122,12 @@ def setTag(read, tag, value):
     @param tag - the tag to add
     @param value - the value of the tag
     '''
+    if tag == CHOICE_TYPE_TAG:
+        if value != 'U' and value != 'Q' and value != 'R':
+            print read
+            print tag
+            print value
+    
     read.tags = read.tags + [(tag, value)]
     
 def dumpReads(firstReads, secondReads):
@@ -1119,17 +1136,14 @@ def dumpReads(firstReads, secondReads):
     @param firstReads - the first set of reads
     @param secondReads - the second set of reads
     '''
-    #import pydevd;pydevd.settrace()
     #old debug junk
     print 'First:'+str(len(firstReads))
     for read in firstReads:
         print read
-        #print hex(read.flag)
     
     print 'Second:'+str(len(secondReads))
     for read in secondReads:
         print read
-        #print hex(read.flag)
         
     print
     
@@ -1294,7 +1308,7 @@ def combinePairs(pairs1, pairs2):
             om2 = getTag(p2[1], OLD_MISMATCH_TAG)
             if oc1 != oc2 or om1 != om2:
                 setTag(p1[1], P_CIGAR_TAG, oc2)
-                setTag(p1[1], P_MISMATCH_TAG, oc2)
+                setTag(p1[1], P_MISMATCH_TAG, om2)
                 setTag(p2[1], M_CIGAR_TAG, oc1)
                 setTag(p2[1], M_MISMATCH_TAG, om1)
             
@@ -1405,27 +1419,12 @@ def combineSingles(singles1, singles2):
                 #set the PO tag
                 setTag(s1, PARENT_OF_ORIGIN_TAG, '3')
                 isFirstSegment = isFlagSet(s1.flag, FIRST_SEGMENT_FLAG)
-                '''
-                if not uniqueSingles.has_key(s1.seq):
-                    uniqueSingles[s1.seq] = []
-                uniqueSingles[s1.seq].append(s1)
-                '''
+                
                 if not uniqueSingles.has_key(isFirstSegment):
                     uniqueSingles[isFirstSegment] = []
                 uniqueSingles[isFirstSegment].append(s1)
                 
             else:
-                '''
-                if not uniqueSingles.has_key(s1.seq):
-                    uniqueSingles[s1.seq] = []
-                
-                #different so keep both around
-                setTag(s1, PARENT_OF_ORIGIN_TAG, '1')
-                uniqueSingles[s1.seq].append(s1)
-                
-                setTag(s2, PARENT_OF_ORIGIN_TAG, '2')
-                uniqueSingles[s2.seq].append(s2)
-                '''
                 isFirstSegment = isFlagSet(s1.flag, FIRST_SEGMENT_FLAG)
                 if not uniqueSingles.has_key(isFirstSegment):
                     uniqueSingles[isFirstSegment] = []
@@ -1440,15 +1439,6 @@ def combineSingles(singles1, singles2):
             singles2.remove(s2)
             
         else:
-            '''
-            if not uniqueSingles.has_key(s1.seq):
-                uniqueSingles[s1.seq] = []
-            
-            #no match, mark it as such
-            setTag(s1, PARENT_OF_ORIGIN_TAG, '1')
-            setTag(s1, YA_TAG, '1')
-            uniqueSingles[s1.seq].append(s1)
-            '''
             isFirstSegment = isFlagSet(s1.flag, FIRST_SEGMENT_FLAG)
             if not uniqueSingles.has_key(isFirstSegment):
                 uniqueSingles[isFirstSegment] = []
@@ -1460,15 +1450,6 @@ def combineSingles(singles1, singles2):
             
             
     for s2 in singles2:
-        '''
-        if not uniqueSingles.has_key(s2.seq):
-            uniqueSingles[s2.seq] = []
-
-        #add anything leftover here
-        setTag(s2, PARENT_OF_ORIGIN_TAG, '2')
-        setTag(s2, YA_TAG, '2')
-        uniqueSingles[s2.seq].append(s2)
-        '''
         isFirstSegment = isFlagSet(s2.flag, FIRST_SEGMENT_FLAG)
         if not uniqueSingles.has_key(isFirstSegment):
             uniqueSingles[isFirstSegment] = []
@@ -1481,6 +1462,10 @@ def combineSingles(singles1, singles2):
     return uniqueSingles
     
 def reducePairsByScore(pairs):
+    '''
+    Iterate through a list of paired-end reads and only return those with the highest scores
+    @param pairs - the pairs to scan
+    '''
     #get the best overall paired score for anything that may be leftover
     bestScore = 0
     bestPairs = []
@@ -1497,6 +1482,10 @@ def reducePairsByScore(pairs):
     return bestPairs
 
 def reduceSinglesByScore(singles):
+    '''
+    Iterate through a list of single-end reads and only return those with the highest scores
+    @param singles - the list of single-end reads to scan
+    '''
     bestSingles = {}
     for seq in singles:
         bestScore = 0
@@ -1527,33 +1516,6 @@ def isFlagSet(value, FLAG):
     else:
         return True
 
-'''
-def isQnameBefore(qnameArray1, qnameArray2):
-'''
-'''
-@param qnameArray1 - the array version of the first qname split along the ':'
-@param qnameArray2 - the array version of the second qname split along the ':'
-@return - True if qnameArray1 comes before qnameArray2
-'''
-'''
-    
-    if len(qnameArray2) == 0:
-        return False
-    
-    if len(qnameArray1) == 0:
-        return True
-    
-    #if they are identical, recurse
-    if qnameArray1[0] == qnameArray2[0]:
-        return isQnameBefore(qnameArray1[1:], qnameArray2[1:])
-    
-    #they are not identical
-    if qnameArray1[0].isdigit() and qnameArray2[0].isdigit():
-        return int(qnameArray1[0]) < int(qnameArray2[0])
-    else:
-        return qnameArray1[0] < qnameArray2[0]
-'''
-
 def isQnameBefore(qname1, qname2):
     '''
     @param qname1 - the first qname
@@ -1571,28 +1533,16 @@ def isQnameBefore(qname1, qname2):
     pos1 = 0
     pos2 = 0
     
-    num1 = 0
-    num2 = 0
+    parts1 = re.split('([0-9]+)', qname1)
+    parts2 = re.split('([0-9]+)', qname2)
     
-    #print qname1+' <? '+qname2
-    
-    while ret == None and pos1 < len(qname1) and pos2 < len(qname2):
-        isNumerical = False
-        
-        #pull out any and all consecutive digits
-        num1 = 0
-        while pos1 < len(qname1) and qname1[pos1].isdigit():
-            num1 = num1*10+int(qname1[pos1])
-            pos1 += 1
-            isNumerical = True
-        
-        num2 = 0
-        while pos2 < len(qname2) and qname2[pos2].isdigit():
-            num2 = num2*10+int(qname2[pos2])
-            pos2 += 1
-            isNumerical = True
-        
+    isNumerical = False
+
+    while ret == None and pos1 < len(parts1) and pos2 < len(parts2):
         if isNumerical:
+            num1 = int(parts1[pos1])
+            num2 = int(parts2[pos2])
+
             #compare those numbers
             if num1 < num2:
                 ret = True
@@ -1602,24 +1552,44 @@ def isQnameBefore(qname1, qname2):
                 #identical
                 pass
         else:
-            #looking at normal letters/symbols
-            if qname1[pos1] < qname2[pos2]:
+            l1 = len(parts1[pos1])
+            l2 = len(parts2[pos2])
+
+            comp1 = parts1[pos1]
+            comp2 = parts2[pos2]
+        
+            if l1 == l2:
+                #looking at normal letters/symbols
+                pass
+            elif l1 < l2:
+                if pos1+1 < l1:
+                    comp1 = comp1 + parts1[pos1+1][0]
+            else:
+                if pos2+1 < l2:
+                    comp2 = comp2 + parts2[pos2+1][0]
+
+            if comp1 < comp2:
                 ret = True
-            elif qname1[pos1] > qname2[pos2]:
+            elif comp1 > comp2:
                 ret = False
             else:
                 #identical
-                pos1 += 1
-                pos2 += 1
                 pass
+
+        pos1 += 1
+        pos2 += 1
+        isNumerical = not isNumerical
     
     if ret == None:
-        #identical
-        ret = False
+        if len(parts1) < len(parts2):
+            ret = True
+        else:
+            #identical or greater
+            ret = False
     
     #print ret
     return ret
-        
+
 def isPositionSame(read1, read2):
     '''
     @param read1 - the first read to check
@@ -1669,12 +1639,7 @@ def initLogger():
     formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S")
     ch.setFormatter(formatter)
     logger.addHandler(ch)
-    
-    #global multilogger
-    #multilogger = multiprocessing.log_to_stderr()
-    #multilogger.setLevel(multiprocessing.SUBDEBUG)
 
-#if __name__ == '__main__':
 def mainRun():
     #start up the logger
     initLogger()
@@ -1708,7 +1673,7 @@ def mainRun():
     #parse the arguments
     args = p.parse_args()
     
-    #check if we should be wordy
+    #TODO: check if we should be wordy
     #if args.verbose:
     #    verbosity = True
     
@@ -1733,24 +1698,14 @@ def mainRun():
     max_queue_size = multiprocessing.Value('i', 100*args.numProcesses)
     #pileupTrees = {}
     
-    #create a merger
-    #merger = MergeImprove(args.mergeType, args.numProcesses)
-    
     #create the manager for the pileups
-    class TreeManager(SyncManager):
+    class SynchronyManager(SyncManager):
         pass
 
-    #TreeManager.register('Tree', AvlTree)
-    #TreeManager.register('AvlNode', AvlNode)
-    #TreeManager.register('updateTree', AvlTree.updateTree)
-    #TreeManager.register('inorder', AvlTree.inorder)
-    #TreeManager.register('getPileupHeight', AvlTree.getPH)
-    #TreeManager.register('getTotalPileupHeight', AvlTree.getTotalPH)
-    #TreeManager.register('getTreeKeys', AvlTree.getTreeKeys, ListProxy)
-    TreeManager.register('numPastStage', Synchronize.numPastStage)
-    TreeManager.register('finishedStage', Synchronize.finishedStage)
+    SynchronyManager.register('numPastStage', Synchronize.numPastStage)
+    SynchronyManager.register('finishedStage', Synchronize.finishedStage)
     
-    manager = TreeManager()
+    manager = SynchronyManager()
     manager.start()
     
     try:
@@ -1789,38 +1744,16 @@ def mainRun():
                 mergeArgs.append(args.outMergedBam+'.tmp'+str(i)+'.bam')
             
             pysam.merge(*mergeArgs)
-            #print pysam.__version__
-            #pysam.merge('-nf', args.outMergedBam, args.outMergedBam+'.tmp0.bam', args.outMergedBam+'.tmp1.bam')
             
             if not args.keepTemp:
                 logger.info('Cleaning up...')
                 for i in range(0, args.numProcesses):
                     os.remove(args.outMergedBam+'.tmp'+str(i)+'.bam')
             
-            logger.info('Merge complete!')
-            
-        #TODO: after these all join, I have several files that need merging
-        #TODO: get the merge statistics
         
-        #merge the files
-        #pairingsDict = merger.mergeAnnotatedBamFiles(args.motherSortedBam, args.fatherSortedBam, args.outMergedBam)
+        logger.info('Merge complete!')
         
-        #get some stats dumped for us
-        #merger.dumpStats()
+        #TODO: get the merge statistics from the results queue
         
-        #check for validity
-        '''
-        if pairingsDict != None:
-            #create a chart of the output
-            logger.info('Finished!')
-            
-            if args.showChart:
-                gc = GradientChart.GradientChart(['Mother Potential Alignments', 'Father Potential Alignments'], pairingsDict)
-                gc.drawChart()
-                
-                merger.showChoiceChart()
-        else:
-            logger.info('Failure during merge process!')
-        '''
 if __name__ == '__main__':
     mainRun()

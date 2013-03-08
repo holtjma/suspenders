@@ -1,7 +1,10 @@
 '''
 Created on Jan 11, 2013
 
-@author: holtjma
+@author: Shunping Huang
+
+These functions were copied from Shunping Huang's Lapels
+Just used for argparse to check that a file exists and/or is read/writable
 '''
 
 import os
