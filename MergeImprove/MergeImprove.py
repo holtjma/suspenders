@@ -5,26 +5,29 @@ Created on Oct 26, 2012
 '''
 
 import pysam #@UnresolvedImport
-import Synchronize
+#import Synchronize
+import Pileup
 import random
 import logging
 import argparse as ap
 import util
 import os
+import sys
 import re
-import time
 import multiprocessing
 from multiprocessing.managers import SyncManager
 
+import pylab
+
 DESC = "A merger of genome alignments."
-VERSION = '0.1.3'
-PKG_VERSION = '0.1.3'
+VERSION = '0.2.0'
+PKG_VERSION = '0.2.0'
 
 #constant flags from the sam specs
 MULTIPLE_SEGMENT_FLAG = 1 << 0 #0x01
 #BOTH_ALIGNED_FLAG = 1 << 1#0x02
 SEGMENT_UNMAPPED_FLAG = 1 << 2#0x04
-OTHER_UNMAPPED_FLAG = 1 << 3#0x08, for all our reads, this SHOULD be (not BOTH_ALIGNED_FLAG)
+OTHER_UNMAPPED_FLAG = 1 << 3#0x08
 FIRST_SEGMENT_FLAG = 1 << 6#0x40
 #SECOND_SEGMENT_FLAG = 1 << 7#0x80
 
@@ -42,10 +45,11 @@ SAVE_RANDOM = 4
 
 #multithread stages
 QUALITY_STAGE = 0
-PRE_PILEUP_STAGE = 1
-PILEUP_STAGE = 2
-CLEANUP_STAGE = 3
-FINISHED_STAGE = 4
+MERGE_PILEUP_STAGE = 1
+CONDENSE_PILEUP_STAGE = 2
+PILEUP_STAGE = 3
+CLEANUP_STAGE = 4
+FINISHED_STAGE = 5
 END_OF_QUEUE = 'EOQ'
 
 #tags from either alignment or lapels
@@ -82,7 +86,8 @@ verbosity = False
 
 class MergeWorker(multiprocessing.Process):
     
-    def __init__(self, readsQueue, resultsQueue, isMaster, firstFilename, secondFilename, outputFilename, mergerType, managerAddress, numProcs, workerID, max_queue_size):
+    def __init__(self, readsQueue, resultsQueue, isMaster, firstFilename, secondFilename, outputFilename, mergerType, isRandomFilter, outHeader,
+                 managerAddress, numProcs, workerID, max_queue_size, pileupDict, keepAll):
         '''
         @param readsQueue - the shared queue where the master will place indicators for the workers to decide what they should process
         @param resultsQueue - the shared queue for storing statistics on the alignments from each worker
@@ -91,6 +96,8 @@ class MergeWorker(multiprocessing.Process):
         @param secondFilename - the second fn to be merged
         @param outputFilename - the overall output filename where the final merge will be, worker won't use this unless a single process scenario
         @param mergerType - union, quality, pileup are the types offered right now
+        @param isRandomFilter - boolean determining whether we random or union at the end
+        @param outHeader - the header to use in any output files
         @param managerAddress - address so that we can connect and access synchronization primitives
         @param numProcs - number of processes
         @param workerID - integer ID, 0 means master
@@ -105,6 +112,7 @@ class MergeWorker(multiprocessing.Process):
                            'P':{'1':0,'2':0,'3':0},
                            'R':{'1':0,'2':0,'3':0},
                            'tot':{'1':0,'2':0,'3':0}}
+        self.percentageChoice = [0 for x in range(0, 101)]
         
         #save the inputs from the init
         self.readsQueue = readsQueue
@@ -113,12 +121,15 @@ class MergeWorker(multiprocessing.Process):
         self.firstFilename = firstFilename
         self.secondFilename = secondFilename
         self.baseOutputFN = outputFilename
+        self.outHeader = outHeader
+        self.isRandomFilter = isRandomFilter
+        self.keepAll = keepAll
         
         if numProcs > 1:
             self.outputFilename = outputFilename+'.tmp'+str(workerID)+'.bam'
             self.isSingleProcess = False
         elif isMaster:
-            self.outputFilename = outputFilename
+            self.outputFilename = outputFilename+'.tmp0.bam'
             self.isSingleProcess = True
         else:
             logger.error('Created non-master process with only 1 process allowed')
@@ -146,16 +157,16 @@ class MergeWorker(multiprocessing.Process):
         
         self.ltm = LocalSynchronyManager(managerAddress)
         self.ltm.connect()
+        self.pileupDict = pileupDict
 
+    '''
     def finishAndBarrierSync(self, stage):
-        '''
-        @param stage - the stage we are waiting to be complete
-        '''
         self.ltm.finishedStage(stage)
         while int(str(self.ltm.numPastStage(stage))) < self.numProcs:
             time.sleep(1)
         
         #once we get here we know everything is at or past this stage
+    '''
         
     def run(self):
         '''
@@ -165,7 +176,12 @@ class MergeWorker(multiprocessing.Process):
             self.fillMergeQueue()
         else:
             self.emptyMergeQueue()
-    
+        
+        #return the same thing regardless of what happened earlier
+        self.statistics['percentageChoice'] = self.percentageChoice
+        self.statistics['outputFilename'] = self.outputFilename
+        self.resultsQueue.put(self.statistics)
+        
     def fillMergeQueue(self):
         '''
         This is the main function that should be called by an outside entity to perform a merge
@@ -182,7 +198,8 @@ class MergeWorker(multiprocessing.Process):
         #TODO: samfile open checks
         
         #open the output file as well
-        self.outputFile = pysam.Samfile(self.outputFilename, 'wb', template=firstFile)
+        #self.outputFile = pysam.Samfile(self.outputFilename, 'wb', template=firstFile)
+        self.outputFile = pysam.Samfile(self.outputFilename, 'wb', header=self.outHeader, referencenames=firstFile.references)
         
         if self.mergerType == PILEUP_MERGE:
             #this one stores pieces counted in the pileup
@@ -354,52 +371,21 @@ class MergeWorker(multiprocessing.Process):
         
         logger.info('[Master] All reads scanned.  Waiting on workers to finish processing...')
         
-        #this handles the sorting and indexing of pileup files
+        #this handles the sorting of this processes pileup file
         if self.mergerType == PILEUP_MERGE:
             self.prepareForPileup()
-        
-        #mark that we're done and barrier sync
-        self.finishAndBarrierSync(QUALITY_STAGE)
-        
-        if self.mergerType == PILEUP_MERGE:
-            #master needs to merge the pileup files, sort, and index them
-            logger.info('[Master] Merging '+str(self.numProcs)+' pileup files...')
-            
-            mergeArgs = ['-f', self.baseOutputFN+'.tmp.pileup_all.bam']
-                
-            for i in range(0, self.numProcs):
-                mergeArgs.append(self.baseOutputFN+'.tmp'+str(i)+'.pileup.sorted.bam')
-            
-            pysam.merge(*mergeArgs)
-            
-            logger.info('[Master] Creating index for pileup file...')
-            
-            pysam.index(self.baseOutputFN+'.tmp.pileup_all.bam')
-        
-        #mark that we're done and barrier sync
-        self.finishAndBarrierSync(PRE_PILEUP_STAGE)
-        
-        #do the pileup analysis if necessary
-        if self.mergerType == PILEUP_MERGE:
-            self.startPileupAnalysis()
-        
-        #mark that pileup is done and barrier sync
-        self.finishAndBarrierSync(PILEUP_STAGE)
-        
-        #clean up excess files
-        self.cleanUpFiles()
-        
-        #sync and finish
-        self.finishAndBarrierSync(CLEANUP_STAGE)
         
         #close the files
         firstFile.close()
         secondFile.close()
         self.outputFile.close()
         
-        logger.info('[0] Finished!')
-        self.resultsQueue.put(self.statistics)
-    
+        logger.info('[0] Completed first pass')
+        
+        
+        
+        #self.resultsQueue.put(self.percentageChoice)
+        
     def emptyMergeQueue(self):
         '''
         This is executed by non-master worker processes
@@ -409,7 +395,7 @@ class MergeWorker(multiprocessing.Process):
         #attempt to open both bam files for merging
         firstFile = pysam.Samfile(self.firstFilename, 'rb')
         secondFile = pysam.Samfile(self.secondFilename, 'rb')
-        self.outputFile = pysam.Samfile(self.outputFilename, 'wb', template=firstFile)
+        self.outputFile = pysam.Samfile(self.outputFilename, 'wb', header=self.outHeader, referencenames=firstFile.references)
         
         firstRead = firstFile.next()
         firstQname = firstRead.qname
@@ -426,7 +412,6 @@ class MergeWorker(multiprocessing.Process):
             self.tempFN = self.outputFilename+'.pileup_tmp.bam'
             self.tempFile = pysam.Samfile(self.tempFN, 'wb', template=firstFile)
             
-        #while (not self.isMaster and self.stage == QUALITY_STAGE) or (self.isMaster and ((self.readingComplete and self.stage == QUALITY_STAGE) or self.readsQueue.qsize() > MAX_QUEUE_SIZE / 2)):
         while self.stage == QUALITY_STAGE:
             firstReads = None
             secondReads = None
@@ -463,29 +448,6 @@ class MergeWorker(multiprocessing.Process):
                     secondRead = None
                     secondQname = None
                 
-                '''
-                startQname = qnames[0]
-                endQname = qnames[1]
-                
-                #skip all reads before the start qname in the first file
-                while firstRead != None and isQnameBefore(firstQname, startQname):
-                    try:
-                        firstRead = firstFile.next()
-                        firstQname = firstRead.qname
-                    except:
-                        firstRead = None
-                        firstQname = None
-                
-                #skip all reads before the start qname in the second file
-                while secondRead != None and isQnameBefore(secondQname, startQname):
-                    try:
-                        secondRead = secondFile.next()
-                        secondQname = secondRead.qname
-                    except:
-                        secondRead = None
-                        secondQname = None
-                '''
-                
                 if firstRead == None:
                     currentQname = secondQname
                 elif secondRead == None:
@@ -495,8 +457,6 @@ class MergeWorker(multiprocessing.Process):
                 else:
                     currentQname = secondQname
                 
-                #while we have a current qname AND (that qname is before the end of the block or is at the end of the block)
-                #while currentQname != None and (isQnameBefore(currentQname, endQname) or currentQname == endQname):
                 numProcessed = 0
                 while currentQname != None and numProcessed < MAX_CLUSTER_SIZE:
                     #each round through this loop is a new set of first and second reads
@@ -546,30 +506,15 @@ class MergeWorker(multiprocessing.Process):
         if self.mergerType == PILEUP_MERGE:
             self.prepareForPileup()
         
-        #mark that we're done and barrier sync
-        self.finishAndBarrierSync(QUALITY_STAGE)
-        
-        #we don't have to do anything in the pre-pileup, it's all on the master
-        self.finishAndBarrierSync(PRE_PILEUP_STAGE)
-        
-        if self.mergerType == PILEUP_MERGE:
-            self.startPileupAnalysis()
-        
-        #mark that pileup is done and barrier sync
-        self.finishAndBarrierSync(PILEUP_STAGE)
-        
-        #clean up excess files
-        self.cleanUpFiles()
-        
-        #sync and finish
-        self.finishAndBarrierSync(CLEANUP_STAGE)
-        
+        firstFile.close()
+        secondFile.close()
         self.outputFile.close()
         
-        logger.info('['+str(self.workerID)+'] Finished!')
+        logger.info('['+str(self.workerID)+'] Completed first pass')
         
-        self.resultsQueue.put(self.statistics)
-    
+        #self.resultsQueue.put(self.statistics)
+        #self.resultsQueue.put(self.percentageChoice)
+        
     def handleSingleIdMerge(self, firstReads, secondReads):
         '''
         This function takes two sets of reads and attempts to pick one of the best alignments to save using region based likelihood
@@ -708,8 +653,8 @@ class MergeWorker(multiprocessing.Process):
         Executed when done processing the first pass of reads from quality scores, basically sort our data so we can merge and 
         build the pileup heights
         '''
-        
         #close the file that has the reads for the pileup calculations
+        self.tempFile.close()
         self.pileupTempFile.close()
         
         logger.info('['+str(self.workerID)+'] Sorting the pileup data...')
@@ -717,207 +662,11 @@ class MergeWorker(multiprocessing.Process):
         #sort the current output file into normal positional sort
         pysam.sort(self.pileupTempPrefix+'.bam', self.pileupTempPrefix+'.sorted')
         
-    def startPileupAnalysis(self):
-        '''
-        Begin handling pileup data
-        TODO: this is mostly incomplete or too slow right now, needs a rework
-        '''
-        logger.info('['+str(self.workerID)+'] Beginning post pileup merge process...')
-        
-        #close the file, any discrepancies are added already
-        self.tempFile.close()
-        
-        #open the file for reading now
-        #TODO: remove this?
-        self.percentageChoice = [0 for x in range(0, 101)]
-        self.tempFile = pysam.Samfile(self.tempFN, 'rb')
-        
-        self.pileupFile = pysam.Samfile(self.baseOutputFN+'.tmp.pileup_all.bam', 'rb')
-        
-        #run through the extras in the temp file
-        try:
-            read = self.tempFile.next()
-            readQname = read.qname
-        except:
-            read = None
-            readQname = None
-        
-        #init
-        currentQname = readQname
-        isMatch = False
-        readsInSet = []
-        
-        #main loop to get all the reads
-        while read != None or isMatch:
-            isMatch = False
-            
-            while readQname == currentQname and readQname != None:
-                #append the read
-                readsInSet.append(read)
-                isMatch = True
-                
-                #see if you can get another
-                try:
-                    read = self.tempFile.next()
-                    readQname = read.qname
-                except:
-                    read = None
-                    readQname = None
-            
-            #now we have all the reads with the same name
-            if not isMatch:
-                #magic to handle the set
-                self.handlePostPileupMerge(readsInSet)
-                
-                #reset these
-                readsInSet = []
-                currentQname = readQname
-        
-        #for fileToClose in self.pileupFiles:
-        #    fileToClose.close()
-        self.pileupFile.close()
-        
-        #close and remove file from system
-        self.tempFile.close()
-        os.remove(self.tempFN)
-        
-        logger.info('['+str(self.workerID)+'] Finished post pileup merge process.  Waiting for other processes...')
-    
-    def handlePostPileupMerge(self, reads):
-        '''
-        This function compares a group of alignments and decides which one to keep
-        @param reads - a set of reads with the same name to be compared using pileup
-        '''
-        avgSum = 0
-        [pairs, singles] = pairReads(reads, PILEUP_HI_TAG)
-        
-        if len(pairs) != 0:
-            bestAvgPileup = -1
-            bestPairs = []
-            
-            for pair in pairs:
-                [tot1, bases1] = self.calcPileupStats(pair[0])
-                [tot2, bases2] = self.calcPileupStats(pair[1])
-                
-                avgPileup = float(tot1+tot2)/(bases1+bases2)
-                avgSum += avgPileup
-                
-                if avgPileup > bestAvgPileup:
-                    bestAvgPileup = avgPileup
-                    bestPairs = []
-                
-                if avgPileup == bestAvgPileup:
-                    bestPairs.append(pair)
-            
-            #stats
-            if len(bestPairs) == 1:
-                setTag(bestPairs[0][0], CHOICE_TYPE_TAG, 'P')
-                setTag(bestPairs[0][1], CHOICE_TYPE_TAG, 'P')
-                
-            #save one of the best pileup pairs
-            self.saveRandomPair(bestPairs)
-            
-            if(bestAvgPileup == 0):
-                self.percentageChoice[0] += 1
-            else:
-                self.percentageChoice[int(100*bestAvgPileup/avgSum)] += 1
-            
-        else:
-            #do this over singles
-            bestAvgPileup = {}
-            bestReads = {}
-            avgSum = 0
-            
-            for read in singles:
-                #if there's nothing yet for this sequence, set it's best as -1 so it gets overwritten below
-                if not bestAvgPileup.has_key(read.seq):
-                    bestAvgPileup[read.seq] = -1
-                    bestReads[read.seq] = []
-                
-                #get the pileup calculation
-                [tot, bases] = self.calcPileupStats(read)
-                avgPileup = float(tot)/bases
-                avgSum += avgPileup
-                
-                #if it's better, keep it
-                if avgPileup > bestAvgPileup[read.seq]:
-                    bestAvgPileup[read.seq] = avgPileup
-                    bestReads[read.seq] = []
-                
-                if avgPileup == bestAvgPileup[read.seq]:    
-                    bestReads[read.seq].append(read)
-            
-            #save the best from each end
-            finAvg = 0
-            for seq in bestReads:
-                brs = bestReads[seq]
-                
-                if len(brs) == 1:
-                    setTag(brs[0], CHOICE_TYPE_TAG, 'P')
-                    
-                self.saveRandomSingle(brs)
-                finAvg += bestAvgPileup[seq]
-                
-            if finAvg == 0:
-                self.percentageChoice[0] += 1
-            else:
-                self.percentageChoice[int(100*finAvg/avgSum)] += 1
-
-    def calcPileupStats(self, read):
-        '''
-        @param read - the read we are calculating
-        @return a pair [total coverage, bases] representing the sum of all coverages over 'bases' number of base pairs
-        '''
-        total = 0
-        bases = 0
-        
-        cig = read.cigar
-        pos = read.pos
-        chrom = read.rname
-        
-        for cigTypePair in cig:
-            cigType = cigTypePair[0]
-            cigLen = cigTypePair[1]
-            
-            if cigType == 0:
-                '''
-                total += int(str(self.ltm.getTotalPileupHeight(chrom, pos, pos+cigLen-1)))
-                '''
-                #iterate through each pileup file
-                #for pf in self.pileupFiles:
-                
-                #get the pileups from this file for that range
-                iterList = self.pileupFile.pileup(self.pileupFile.getrname(chrom), pos, pos+cigLen-1)
-                for pc in iterList:
-                    #add the number of pileups at this base
-                    total += pc.n
-            
-                #modify the bases and position
-                bases += cigLen
-                pos += cigLen
-                
-            elif cigType == 1:
-                #insertion to the reference
-                #no change to position, these will be ignored bases though
-                pass
-            elif cigType == 2:
-                #deletion to the reference
-                #modify position by the second value
-                pos += cigLen
-            elif cigType == 3:
-                #skipped region
-                #modify the position by the second value
-                pos += cigLen
-            else:
-                print 'UNHANDLED CIG TYPE:'+cigType
-                
-        return [total, bases]
-        
     def cleanUpFiles(self):
         '''
         this function removes the temporary files from doing the pileup calculations
         '''
-        if self.mergerType == PILEUP_MERGE:
+        if self.mergerType == PILEUP_MERGE and not self.keepAll:
             #remove all the extra pileup files
             os.remove(self.baseOutputFN+'.tmp'+str(self.workerID)+'.pileup.bam')
             os.remove(self.baseOutputFN+'.tmp'+str(self.workerID)+'.pileup.sorted.bam')
@@ -961,17 +710,29 @@ class MergeWorker(multiprocessing.Process):
         @param possiblePairs - a list of possible pairs that could be saved
         @param parent - the parent of origin for these pairs, can be SET indicating a mix of pairs that already have it set
         '''
-        #pick a random pair
-        rv = random.randint(0, len(possiblePairs)-1)
-        
         if len(possiblePairs) > 1:
-            #random choice
-            setTag(possiblePairs[rv][0], CHOICE_TYPE_TAG, 'R')
-            setTag(possiblePairs[rv][1], CHOICE_TYPE_TAG, 'R')
+            if self.isRandomFilter:
+                #pick a random pair
+                rv = random.randint(0, len(possiblePairs)-1)
             
-        #save the pair
-        self.saveRead(possiblePairs[rv][0])
-        self.saveRead(possiblePairs[rv][1])
+                #random choice
+                setTag(possiblePairs[rv][0], CHOICE_TYPE_TAG, 'R')
+                setTag(possiblePairs[rv][1], CHOICE_TYPE_TAG, 'R')
+                
+                #save the pair
+                self.saveRead(possiblePairs[rv][0])
+                self.saveRead(possiblePairs[rv][1])
+            else:
+                for pair in possiblePairs:
+                    setTag(pair[0], CHOICE_TYPE_TAG, 'K')
+                    setTag(pair[1], CHOICE_TYPE_TAG, 'K')
+                    
+                    self.saveRead(pair[0])
+                    self.saveRead(pair[1])
+        else:
+            #save the pair
+            self.saveRead(possiblePairs[0][0])
+            self.saveRead(possiblePairs[0][1])
         
         
     def saveRandomSingle(self, possibleSingles):
@@ -979,13 +740,18 @@ class MergeWorker(multiprocessing.Process):
         @param possibleSingles - a list of possible singles that could be saved
         @param parent - the parent of origin for these singles, can be SET indicating a mix of pairs that already have it set
         '''
-        #pick a random single and save it
-        rv = random.randint(0, len(possibleSingles)-1)
-        
         if len(possibleSingles) > 1:
-            setTag(possibleSingles[rv], CHOICE_TYPE_TAG, 'R')
-        
-        self.saveRead(possibleSingles[rv])
+            if self.isRandomFilter:
+                #pick a random single and save it
+                rv = random.randint(0, len(possibleSingles)-1)
+                setTag(possibleSingles[rv], CHOICE_TYPE_TAG, 'R')
+                self.saveRead(possibleSingles[rv])
+            else:
+                for single in possibleSingles:
+                    setTag(single, CHOICE_TYPE_TAG, 'K')
+                    self.saveRead(single)
+        else:
+            self.saveRead(possibleSingles[0])
     
     def parseReadForTree(self, readToParse):
         '''
@@ -996,13 +762,27 @@ class MergeWorker(multiprocessing.Process):
         
         #save the read
         self.pileupTempFile.write(readToParse)
+        
+def saveChoiceChart(data, fn, titleFn):
+    #import pydevd;pydevd.settrace()
+    logger.info('Generating pileup dominance percentage chart')
+    pylab.figure(1)
+    xaxis = [x for x in range(0, len(data))]
+    pylab.bar(xaxis, data)
+    pylab.title(titleFn)
+    pylab.xlabel('Pileup dominance (%)')
+    pylab.xlim(xmin=0, xmax=101)
+    pylab.ylabel('Number of read ends')
+    pylab.grid(True)
+    pylab.savefig(fn)
+    logger.info('Chart data: '+str(data))
+    logger.info('Chart saved to "'+fn+'".')
 
 def calculatePairScore(readPair):
     '''
     @param readPair - the paired end read that needs a score calculated
     @return - the score associated with the paired end read
     '''
-    
     #get the tags from the pair
     oc1 = getTag(readPair[0], OLD_CIGAR_TAG)
     oc2 = getTag(readPair[1], OLD_CIGAR_TAG)
@@ -1040,7 +820,8 @@ def calculateScore(cigar, editDistance):
     
     #scoring constants as gathered from the bowtie website
     #TODO: make these user-configurable
-    MATCH = 2
+    #MATCH = 2
+    MATCH = 0
     MISMATCH = -6
     GAP_OPEN = -5
     EXTENSION = -3
@@ -1122,12 +903,6 @@ def setTag(read, tag, value):
     @param tag - the tag to add
     @param value - the value of the tag
     '''
-    if tag == CHOICE_TYPE_TAG:
-        if value != 'U' and value != 'Q' and value != 'R':
-            print read
-            print tag
-            print value
-    
     read.tags = read.tags + [(tag, value)]
     
 def dumpReads(firstReads, secondReads):
@@ -1199,6 +974,9 @@ def pairReads(reads, pairTag):
     if len(readsLookup) != 0:
         print pairTag
         print readsLookup
+        
+        dumpReads(reads, [])
+        
         for tagValue in readsLookup:
             singles.append(readsLookup[tagValue])
     
@@ -1467,11 +1245,11 @@ def reducePairsByScore(pairs):
     @param pairs - the pairs to scan
     '''
     #get the best overall paired score for anything that may be leftover
-    bestScore = 0
+    bestScore = None
     bestPairs = []
     for pair in pairs:
         score = calculatePairScore(pair)
-        if score > bestScore:
+        if bestScore == None or score > bestScore:
             bestScore = score
             bestPairs = []
             
@@ -1488,12 +1266,12 @@ def reduceSinglesByScore(singles):
     '''
     bestSingles = {}
     for seq in singles:
-        bestScore = 0
+        bestScore = None
         bests = []
         
         for single in singles[seq]:
             score = calculateReadScore(single)
-            if score > bestScore:
+            if bestScore == None or score > bestScore:
                 bestScore = score
                 bests = []
             
@@ -1632,13 +1410,61 @@ def initLogger():
     This code taken from Shunping's Lapels for initializing a logger
     '''
     global logger
-    logger = logging.getLogger()
+    logger = logging.getLogger('root')
     logger.setLevel(logging.DEBUG)
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
     formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S")
     ch.setFormatter(formatter)
     logger.addHandler(ch)
+    
+def getLogger():
+    return logging.getLogger('root')
+
+def performInputChecks(fn1, fn2):
+    bam1 = pysam.Samfile(fn1, 'rb')
+    bam2 = pysam.Samfile(fn2, 'rb')
+    
+    retHeader = dict(bam1.header.items())
+    h2 = dict(bam2.header.items())
+    
+    if retHeader['HD']['SO'] != 'query_name':
+        logger.error('File "'+fn1+'" is not sorted by name.')
+        return None
+    
+    if h2['HD']['SO'] != 'query_name':
+        logger.error('File "'+fn2+'" is not sorted by name.')
+        return None
+    
+    #first combine the header if h2 has a header to combine with
+    if h2.has_key('PG'):
+        #set h2 to different keys before combining
+        for pg in h2['PG']:
+            pg['ID'] = pg['ID'] + ' #2'
+            if pg.has_key('PP'):
+                pg['PP'] = pg['PP'] + ' #2'
+                
+        if retHeader.has_key('PG'):
+            #finally combine them
+            retHeader['PG'] = h2['PG'] + retHeader['PG']
+            
+        else:
+            #no data was in the original PG, so copy the one from h2
+            retHeader['PG'] = h2['PG']
+    
+        
+    #now try adding my header so final result should be suspenders, h2, h1
+    try:
+        retHeader['PG'] = [{'ID': 'Suspenders', 'VN': PKG_VERSION,
+                            'PP': retHeader['PG'][0]['ID'],
+                            'CL': ' '.join(sys.argv)}] + retHeader['PG']
+    except KeyError:
+        retHeader['PG'] = [{'ID': 'Suspenders', 'VN': PKG_VERSION,
+                            'CL': ' '.join(sys.argv)}]
+    bam1.close()
+    bam2.close()
+    
+    return retHeader
 
 def mainRun():
     #start up the logger
@@ -1652,18 +1478,25 @@ def mainRun():
                    ' %s in Suspenders %s' % (VERSION, PKG_VERSION))
     
     group = p.add_mutually_exclusive_group()
-    group.add_argument('-u', '--union', dest='mergeType', action='store_const', const=UNION_MERGE, help='merge the files using the union technique', default=RANDOM_MERGE)
-    group.add_argument('-s', '--quality', dest='mergeType', action='store_const', const=RANDOM_MERGE, help='merge the files using the quality score, then randomly choosing (default)', default=RANDOM_MERGE)
-    group.add_argument('-t', '--pileup', dest='mergeType', action='store_const', const=PILEUP_MERGE, help='merge the files using the quality score, then the pileup heights, then randomly choosing', default=RANDOM_MERGE)
+    group.add_argument('-u', '--union', dest='mergeType', action='store_const', const=UNION_MERGE, help='merge the files using the union filter', default=RANDOM_MERGE)
+    group.add_argument('-s', '--quality', dest='mergeType', action='store_const', const=RANDOM_MERGE, help='merge the files using the quality filter (default)', default=RANDOM_MERGE)
+    group.add_argument('-t', '--pileup', dest='mergeType', action='store_const', const=PILEUP_MERGE, help='merge the files using the quality filter, then the pileup height filter', default=RANDOM_MERGE)
     
-    #TODO: do more than just affect the end merge files
-    p.add_argument('-k', '--keep-temp', dest='keepTemp', action='store_true', help='keep all temporary files on the file system', default=False)
+    #optional arguments
+    group2 = p.add_mutually_exclusive_group()
+    group2.add_argument('-k', '--union-filter', dest='isRandomFilter', action='store_false', help='use union filter if other filters fail (always active for --union)', default=True)
+    group2.add_argument('-r', '--random-filter', dest='isRandomFilter', action='store_true', help='use random filter if other filters fail (default for --quality and --pileup)', default=True)
     
-    #optional argument
-    #p.add_argument('-c', dest='showChart', action='store_true', help='show distribution chart (default: no)')
+    #number of processes is next in importance
+    p.add_argument('-p', metavar='numProcesses', dest='numProcesses', type=int, default=1, help='number of processes to run (default: 1)')
+    
+    #superfluous/debugging arguments
+    #p.add_argument('-c', dest='showChart', action='store_true', help='show distribution chart for pileups only (default: no)', default=False)
+    p.add_argument('-c', metavar='chartFilename', dest='chartFilename', type=str, help='save pileup chart to an image (default: none)', default=None)
     #p.add_argument('-v', dest='verbose', action='store_true', help='verbose (default: no)')
     
-    p.add_argument('-p', metavar='numProcesses', dest='numProcesses', type=int, default=1, help='number of processes to run (default: 1)')
+    #TODO: do we want to affect more than just the end merge files? no for now
+    p.add_argument('-e', '--keep-temp', dest='keepTemp', action='store_true', help='keep the temporary merge files', default=False)
     
     #required main arguments
     p.add_argument('motherSortedBam', type=util.readableFile, help='the bam file of the sorted by name alignment to the mother pseudogenome')
@@ -1679,18 +1512,36 @@ def mainRun():
     
     if args.mergeType == UNION_MERGE:
         mt = 'Union'
+        ft = 'Unique->Kept-All'
     elif args.mergeType == RANDOM_MERGE:
-        mt = 'Quality->Random'
+        mt = 'Quality'
+        ft = 'Unique->Quality->'
     elif args.mergeType == PILEUP_MERGE:
-        mt = 'Quality->Pileup->Random'
+        mt = 'Pileup'
+        ft = 'Unique->Quality->Pileup->'
     else:
         mt = 'ERROR: Unknown'
-    
-    logger.info('Merge Type: '+mt)
+        ft = 'ERROR: Unknown'
+        
+    if args.mergeType != UNION_MERGE:
+        if args.isRandomFilter:
+            ft += 'Random'
+        else:
+            ft += 'Kept-All'
+
+    logger.info('Merge Type:'+mt)
+    logger.info('Filter Type: '+ft)
     logger.info('Mother: '+args.motherSortedBam)
     logger.info('Father: '+args.fatherSortedBam)
     logger.info('Output: '+args.outMergedBam)
     logger.info('Number of processes: '+str(args.numProcesses))
+    if args.keepTemp:
+        logger.info('Keep temporary files: True')
+    
+    outHeader = performInputChecks(args.motherSortedBam, args.fatherSortedBam)
+    if outHeader == None:
+        #there was an error reported, end program
+        return
     
     readsQueue = multiprocessing.Queue()
     resultsQueue = multiprocessing.Queue()
@@ -1702,28 +1553,31 @@ def mainRun():
     class SynchronyManager(SyncManager):
         pass
 
-    SynchronyManager.register('numPastStage', Synchronize.numPastStage)
-    SynchronyManager.register('finishedStage', Synchronize.finishedStage)
+    #SynchronyManager.register('numPastStage', Synchronize.numPastStage)
+    #SynchronyManager.register('finishedStage', Synchronize.finishedStage)
     
     manager = SynchronyManager()
     manager.start()
+    myPileupDict = manager.dict()
     
     try:
         #create any extra workers
         workerThreads = []
         for i in range(1, args.numProcesses):
-            p = MergeWorker(readsQueue, resultsQueue, False, args.motherSortedBam, args.fatherSortedBam, args.outMergedBam, args.mergeType, manager.address, args.numProcesses, i, max_queue_size)
+            p = MergeWorker(readsQueue, resultsQueue, False, args.motherSortedBam, args.fatherSortedBam, args.outMergedBam, args.mergeType, args.isRandomFilter, outHeader, 
+                            manager.address, args.numProcesses, i, max_queue_size, myPileupDict, args.keepTemp)
             p.start()
             workerThreads.append(p)
         
         #create the master
-        masterProcess = MergeWorker(readsQueue, resultsQueue, True, args.motherSortedBam, args.fatherSortedBam, args.outMergedBam, args.mergeType, manager.address, args.numProcesses, 0, max_queue_size)
+        masterProcess = MergeWorker(readsQueue, resultsQueue, True, args.motherSortedBam, args.fatherSortedBam, args.outMergedBam, args.mergeType, args.isRandomFilter, outHeader, 
+                                    manager.address, args.numProcesses, 0, max_queue_size, myPileupDict, args.keepTemp)
         masterProcess.start()
         
         masterProcess.join()
         for p in workerThreads:
             p.join()
-            
+        
         normalEnd = True
     except KeyboardInterrupt:
         logger.info('Terminating program')
@@ -1732,28 +1586,145 @@ def mainRun():
             p.terminate()
         
         normalEnd = False
+        
+    if normalEnd and args.mergeType == PILEUP_MERGE:
+        #master needs to merge the pileup files, sort, and index them
+        logger.info('[Master] Merging '+str(args.numProcesses)+' pileup files...')
+        mergeArgs = ['-f', args.outMergedBam+'.tmp.pileup_all.bam']
+            
+        for i in range(0, args.numProcesses):
+            mergeArgs.append(args.outMergedBam+'.tmp'+str(i)+'.pileup.sorted.bam')
+        
+        if args.numProcesses > 1:
+            pysam.merge(*mergeArgs)
+        else:
+            pysam.sort(args.outMergedBam+'.tmp0.pileup.sorted.bam', args.outMergedBam+'.tmp.pileup_all')
+            
+        logger.info('[Master] Creating index for pileup file...')
+        pysam.index(args.outMergedBam+'.tmp.pileup_all.bam')
+    
+        #create the pileup stuff using pools
+        #in queue a bunch of chromosome names, sorted descending
+        firstFile = pysam.Samfile(args.motherSortedBam)
+        sqHead = firstFile.header['SQ']
+        sqHead = sorted(sqHead, key=lambda k: k['LN'], reverse=True)
+        firstFile.close()
+        
+        constructedArgs = []
+        for x in sqHead:
+            constructedArgs.append((args.outMergedBam+'.tmp.pileup_all.bam', x))
+        
+        #begin processing
+        myPool = multiprocessing.Pool(args.numProcesses)
+        results = myPool.map(Pileup.createPH, constructedArgs)
+        
+        #use the same semaphore lock for everything
+        #NOTE: this isn't really locking because we allow all processes access at the same time, it's read only so should be fine
+        sem = multiprocessing.Semaphore(args.numProcesses)
+        
+        sharedDict = {}
+        for index in range(0, len(results)):
+            res = results[index]
+            chrom = res.keys()[0]
+            values = res[chrom]
+            sharedDict[chrom] = multiprocessing.Array('i', len(values), lock=sem)
+            for x in range(0, len(values)):
+                sharedDict[chrom][x] = values[x]
+            results[index] = None
+        
+        try:
+            pws = []
+            
+            for x in range(0, args.numProcesses):
+                #create more pileup files that we can merge in
+                pw = Pileup.PileupWorker(sharedDict, resultsQueue, args.outMergedBam, args.isRandomFilter, outHeader, x, args.keepTemp)
+                pw.start()
+                pws.append(pw)
+            
+            for pw in pws:
+                pw.join()
+                
+            normalEnd = True
+        except KeyboardInterrupt:
+            logger.info('Terminating program')
+            for pw in pws:
+                pw.terminate()
+            
+            normalEnd = False
+        
+        if normalEnd:
+            os.remove(args.outMergedBam+'.tmp.pileup_all.bam')
+            os.remove(args.outMergedBam+'.tmp.pileup_all.bam.bai')
     
     if normalEnd:
-        if args.numProcesses > 1:
-            logger.info('Merging '+str(args.numProcesses)+' result files...')
+        #first parse the results
+        res = []
+        filenameToResults = {}
+        while True:
+            try:
+                data = resultsQueue.get_nowait()
+            except:
+                break
             
+            pcData = data['percentageChoice']
+            filenameToResults[data['outputFilename']] = data
+            res.append(pcData)
+        
+        if args.numProcesses > 1 or args.mergeType == PILEUP_MERGE:
             #TODO: this causes problems if a file is empty, add a fix?
             mergeArgs = ['-fn', args.outMergedBam]
             
             for i in range(0, args.numProcesses):
-                mergeArgs.append(args.outMergedBam+'.tmp'+str(i)+'.bam')
+                totVals = filenameToResults[args.outMergedBam+'.tmp'+str(i)+'.bam']['tot']
+                if totVals['1'] > 0 or totVals['2'] > 0 or totVals['3'] > 0:
+                    mergeArgs.append(args.outMergedBam+'.tmp'+str(i)+'.bam')
+                
+                if args.mergeType == PILEUP_MERGE:
+                    totVals = filenameToResults[args.outMergedBam+'.tmp'+str(i)+'.bam.pileup_complete.bam']['tot']
+                    if totVals['1'] > 0 or totVals['2'] > 0 or totVals['3'] > 0:
+                        mergeArgs.append(args.outMergedBam+'.tmp'+str(i)+'.bam.pileup_complete.bam')
             
-            pysam.merge(*mergeArgs)
+            #print mergeArgs
+            logger.info('Merging '+str(len(mergeArgs)-2)+' results files...')
+            if len(mergeArgs) == 2:
+                logger.warning('No files to merge, output not generated.  Check inputs for valid data.')
+            elif len(mergeArgs) == 3:
+                #only one file to "merge", just rename it
+                os.rename(mergeArgs[2], mergeArgs[1])
+            else:
+                pysam.merge(*mergeArgs)
             
             if not args.keepTemp:
                 logger.info('Cleaning up...')
                 for i in range(0, args.numProcesses):
-                    os.remove(args.outMergedBam+'.tmp'+str(i)+'.bam')
-            
+                    try:
+                        os.remove(args.outMergedBam+'.tmp'+str(i)+'.bam')
+                    except:
+                        logger.info('Failed to remove '+args.outMergedBam+'.tmp'+str(i)+'.bam from the file system.')
+                        
+                    if args.mergeType == PILEUP_MERGE:
+                        try:
+                            os.remove(args.outMergedBam+'.tmp'+str(i)+'.bam.pileup_complete.bam')
+                        except:
+                            logger.info('Failed to remove '+args.outMergedBam+'.tmp'+str(i)+'.bam.pileup_complete.bam from the file system.')
         
         logger.info('Merge complete!')
         
-        #TODO: get the merge statistics from the results queue
+        if args.chartFilename != None and args.mergeType == PILEUP_MERGE:
+            '''
+            res = []
+            while True:
+                try:
+                    data = resultsQueue.get_nowait()
+                except:
+                    break
+                
+                print data
+                pcData = data['percentageChoice']
+                res.append(pcData)
+            '''
+            sumData = [sum(a) for a in zip(*res)]
+            saveChoiceChart(sumData, args.chartFilename, args.outMergedBam)
         
 if __name__ == '__main__':
     mainRun()
