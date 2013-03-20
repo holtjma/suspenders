@@ -20,8 +20,8 @@ from multiprocessing.managers import SyncManager
 import pylab
 
 DESC = "A merger of genome alignments."
-VERSION = '0.2.0'
-PKG_VERSION = '0.2.0'
+VERSION = '0.2.1'
+PKG_VERSION = '0.2.1'
 
 #constant flags from the sam specs
 MULTIPLE_SEGMENT_FLAG = 1 << 0 #0x01
@@ -195,10 +195,7 @@ class MergeWorker(multiprocessing.Process):
         firstFile = pysam.Samfile(self.firstFilename, 'rb')
         secondFile = pysam.Samfile(self.secondFilename, 'rb')
         
-        #TODO: samfile open checks
-        
         #open the output file as well
-        #self.outputFile = pysam.Samfile(self.outputFilename, 'wb', template=firstFile)
         self.outputFile = pysam.Samfile(self.outputFilename, 'wb', header=self.outHeader, referencenames=firstFile.references)
         
         if self.mergerType == PILEUP_MERGE:
@@ -208,9 +205,6 @@ class MergeWorker(multiprocessing.Process):
             #this one stores those to be resolved by pileup
             self.tempFN = self.outputFilename+'.pileup_tmp.bam'
             self.tempFile = pysam.Samfile(self.tempFN, 'wb', template=firstFile)
-        
-        #TODO: update headers?
-        #print firstFile.header
         
         #start with no qname
         currentQname = None
@@ -530,9 +524,11 @@ class MergeWorker(multiprocessing.Process):
         [firstPairs, firstSingles] = pairReads(firstReads, 'HI')
         [secondPairs, secondSingles] = pairReads(secondReads, 'HI')
         
-        #TODO: remove this later
+        '''
+        #remove this later
         if (len(firstPairs) > 0 and len(firstSingles) > 0) or (len(secondPairs) > 0 and len(secondSingles) > 0):
             dumpReads(firstReads, secondReads)
+        '''
         
         #combine reads but keep all of them regardless of score
         possiblePairs = combinePairs(firstPairs, secondPairs)
@@ -691,9 +687,8 @@ class MergeWorker(multiprocessing.Process):
         choice = getTag(readToSave, CHOICE_TYPE_TAG)
         parent = getTag(readToSave, PARENT_OF_ORIGIN_TAG)
         
-        #TODO: remove this print error
         if parent == None or choice == None:
-            print 'ERROR:'+str(readToSave)
+            logger.error('Missing parent and/or choice tags:'+str(readToSave))
         else:
             if self.statistics.has_key(choice) and self.statistics[choice].has_key(parent):
                 self.statistics[choice][parent] += 1
@@ -1491,11 +1486,9 @@ def mainRun():
     p.add_argument('-p', metavar='numProcesses', dest='numProcesses', type=int, default=1, help='number of processes to run (default: 1)')
     
     #superfluous/debugging arguments
-    #p.add_argument('-c', dest='showChart', action='store_true', help='show distribution chart for pileups only (default: no)', default=False)
     p.add_argument('-c', metavar='chartFilename', dest='chartFilename', type=str, help='save pileup chart to an image (default: none)', default=None)
     #p.add_argument('-v', dest='verbose', action='store_true', help='verbose (default: no)')
     
-    #TODO: do we want to affect more than just the end merge files? no for now
     p.add_argument('-e', '--keep-temp', dest='keepTemp', action='store_true', help='keep the temporary merge files', default=False)
     
     #required main arguments
@@ -1671,9 +1664,10 @@ def mainRun():
             res.append(pcData)
         
         if args.numProcesses > 1 or args.mergeType == PILEUP_MERGE:
-            #TODO: this causes problems if a file is empty, add a fix?
             mergeArgs = ['-fn', args.outMergedBam]
             
+            #this loop makes sure that there is something in the file we're trying to merge, it crashes samtools merge if 
+            #we try to merge something with an empty file
             for i in range(0, args.numProcesses):
                 totVals = filenameToResults[args.outMergedBam+'.tmp'+str(i)+'.bam']['tot']
                 if totVals['1'] > 0 or totVals['2'] > 0 or totVals['3'] > 0:
@@ -1711,18 +1705,6 @@ def mainRun():
         logger.info('Merge complete!')
         
         if args.chartFilename != None and args.mergeType == PILEUP_MERGE:
-            '''
-            res = []
-            while True:
-                try:
-                    data = resultsQueue.get_nowait()
-                except:
-                    break
-                
-                print data
-                pcData = data['percentageChoice']
-                res.append(pcData)
-            '''
             sumData = [sum(a) for a in zip(*res)]
             saveChoiceChart(sumData, args.chartFilename, args.outMergedBam)
         

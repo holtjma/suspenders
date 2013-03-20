@@ -1,12 +1,15 @@
 Introduction
 ============
 
-Suspenders merges two alignments of the same reads to different in silico genomes which typically represent the mother's and father's genomes.
+Suspenders merges two alignments of the same reads to different in silico genomes which typically represent the 
+mother's and father's genomes.
 
 Two files are taken as input:
 	(1) a BAM file that contains the first alignment to the mother's in silico genome
 	(2) a BAM file that contains the second alignment to the father's in silico genome
-These two alignments must be pre-processed by Lapels before running Suspenders so they can be compared in the same reference coordinates system.  Additionally, both input files need to be sorted by read name (as opposed to coordinates).
+These two alignments must be pre-processed by Lapels before running Suspenders so they can be compared in the 
+same reference coordinates system.  Additionally, both input files need to be sorted by read name (as opposed 
+to coordinates).
 
 For detailed usage, please type after installation:
 
@@ -20,23 +23,36 @@ Suspenders and its modules have been tested under Python 2.7.
 
 Several python modules are required to run the code.
 
-* [pysam] - Tested with pysam 0.7.4
+*[pysam] - Tested with pysam 0.7.4
 
-As a wrapper of Samtools, the pysam module facilitates the manipulation of SAM/BAM files in Python. Its latest package can be downloaded from:
+As a wrapper of Samtools, the pysam module facilitates the manipulation of SAM/BAM files in Python. Its latest 
+package can be downloaded from:
 
 	http://code.google.com/p/pysam/
 
 
 *[argparse] - Tested with argparse 1.2.1
 
-The argparse module is used to parse the command line arguments of the module. It has been maintained in Python Standard Library since Python 2.7. Its latest package can be downloaded from:
+The argparse module is used to parse the command line arguments of the module. It has been maintained in Python 
+Standard Library since Python 2.7.  Its latest package can be downloaded from:
 
 	http://code.google.com/p/argparse/
 
-* others
-Reads that have multiple alignments are required to have the 'HI' tag to specify the hit index.  Recent aligners (eg. bowtie >= 0.12.8 and tophat >= 1.4.0) will create this tag.  It is recommended to use a recent version for read alignment.
+*[matplotlib]
 
-Lapels is a pre-processing requirement after the two alignments.  This will put both input files into the same coordinate system for comparison while merging.  Its latest package can be downloaded from:
+The matplotlib module helps generate some statistical output charts for the pileup data.  It will also allow future
+modification to the code for generating more informative statistical images.  Its latest package can be downloaded
+from:
+
+	http://matplotlib.org
+
+* others
+Reads that have multiple alignments are required to have the 'HI' tag to specify the hit index.  Recent 
+aligners (eg. bowtie >= 0.12.8 and tophat >= 1.4.0) will create this tag.  It is recommended to use a recent 
+version for read alignment.
+
+Lapels is a pre-processing requirement after the two alignments.  This will put both input files into the same 
+coordinate system for comparison while merging.  Its latest package can be downloaded from:
 
 	http://code.google.com/p/lapels/
 
@@ -44,7 +60,8 @@ Lapels is a pre-processing requirement after the two alignments.  This will put 
 Installation
 ============
 
-It is recommended to use easy-install (http://packages.python.org/distribute/easy_install.html) for the installation.
+It is recommended to use easy-install (http://packages.python.org/distribute/easy_install.html) for the 
+installation.
 
 	easy_install suspenders
 
@@ -56,10 +73,11 @@ and then type:
 
 	easy_install suspenders-<version>.tar.gz
 
-By default, the package will be installed under the directory of Python dist-packages, and the executable of pysuspenders can be found under '/usr/local/bin/'.
+By default, the package will be installed under the directory of Python dist-packages, and the executable of 
+pysuspenders can be found under '/usr/local/bin/'.
 
-If you don't have permission to install it in the system-owned directory, you
-can install it in locally following the next steps:
+If you don't have permission to install it in the system-owned directory, you can install it in locally following 
+the next steps:
 
 (1) Create a local package directory for python:
 
@@ -85,13 +103,24 @@ After installation, pysuspenders will be located in '/home/$USER/.local/lib/pyth
 
 Merge Types
 ===========
-The different types are based on a set of filters to pull out reads that have already been successfully merged.  Each filter catches a set of reads and marks them with a 'ct' tag denoting which filter caught that particular read.  See the 'ct' tag in examples for specific on how the filter works.
+The different types are based on a set of filters to pull out reads that have already been successfully merged.  
+Each filter catches a set of reads and marks them with a 'ct' tag denoting which filter caught that particular 
+read.  See the 'ct' tag in examples for specific on how the filter works.
 
-Union: Keep all the read alignments from both files, but if the alignments are identical (position, cigar string, edit distance), only store one copy of the read.  For example, if read A aligns to positions 1 and 2 in the mother and positions 2 and 3 in the father, the result will be a single read at each of the positions 1, 2, and 3.  Filter order: Unique->Kept-All
+Union: Keep all the read alignments from both files, but if the alignments are identical (position, cigar string, 
+edit distance), only store one copy of the read.  For example, if read A aligns to positions 1 and 2 in the mother 
+and positions 2 and 3 in the father, the result will be a single read at each of the positions 1, 2, and 3.  
+Filter order: Unique->Kept-All
 
-Quality: Keep the single best alignment based on the quality score from 'http://bowtie-bio.sourceforge.net/bowtie2/manual.shtml#local-alignment-score-example'.  If two or more alignments have the same score, they will be passed on to the next filter.  Filter order: Unique->Quality->[Random, Kept-All]
+Quality: Keep the single best alignment based on the quality score from 
+'http://bowtie-bio.sourceforge.net/bowtie2/manual.shtml#local-alignment-score-example'.  If two or more alignments 
+have the same score, they will be passed on to the next filter.  
+Filter order: Unique->Quality->[Random, Kept-All]
 
-Pileup: Keep the single best alignment based on the pileup heights.  The pileup heights are calculated using only alignments that have already been filtered by Unique or Quality.  Note: storing pileup data requires more memory than the other two merge types.  Filter order: Unique->Quality->Pileup->[Random, Kept-All]
+Pileup: Keep the single best alignment based on the pileup heights.  The pileup heights are calculated using only 
+alignments that have already been filtered by Unique or Quality.  Note: storing pileup data requires more memory 
+than the other two merge types.  
+Filter order: Unique->Quality->Pileup->[Random, Kept-All]
 
 Examples
 ========
@@ -104,27 +133,36 @@ To run on the example files, navigate to the examples folder and run:
 
 	pysuspenders -t ./mother.bam ./father.bam ./merged.bam
 
-The following are snippets of the content in the input and output BAM file in the examples (gathered using 'samtools view merged.bam').
+The following are snippets of the content in the input and output BAM file in the examples (gathered using 
+'samtools view merged.bam').
 
 mother.bam:
 ...
-UNC9-SN296_0254:7:1101:1482:32883#CGATGT 153 chr2 22809107 50 25M3406N75M * 0 0 <SEQ> <MAPQ> NH:i:1 MD:Z:30C69 OM:i:1 XO:i:0 XM:i:1 i0:i:0 s0:i:0 OC:Z:25M3405N75M XG:i:0 AS:i:-1 XS:A:- d0:i:0
+UNC9-SN296_0254:7:1101:1482:32883#CGATGT 153 chr2 22809107 50 25M3406N75M * 0 0 <SEQ> <MAPQ> 
+NH:i:1 MD:Z:30C69 OM:i:1 XO:i:0 XM:i:1 i0:i:0 s0:i:0 OC:Z:25M3405N75M XG:i:0 AS:i:-1 XS:A:- d0:i:0
 ...
-UNC9-SN296_0254:7:1101:1483:94304#CGATGT 137 chr1 81336983 50 100M * 0 0 <SEQ> <MAPQ> NH:i:1 MD:Z:69A13C16 OM:i:2 XN:i:0 XO:i:0 XM:i:2 i0:i:0 s0:i:0 OC:Z:100M XG:i:0 AS:i:-7 YT:Z:UU d0:i:0
+UNC9-SN296_0254:7:1101:1483:94304#CGATGT 137 chr1 81336983 50 100M * 0 0 <SEQ> <MAPQ> 
+NH:i:1 MD:Z:69A13C16 OM:i:2 XN:i:0 XO:i:0 XM:i:2 i0:i:0 s0:i:0 OC:Z:100M XG:i:0 AS:i:-7 YT:Z:UU d0:i:0
 ...
 
 father.bam:
 ...
-UNC9-SN296_0254:7:1101:1482:32883#CGATGT 153 chr2 22809107 50 25M3406N75M * 0 0 <SEQ> <MAPQ> NH:i:1 MD:Z:30C69 OM:i:1 XO:i:0 XM:i:1 i0:i:0 s0:i:0 OC:Z:25M3407N75M XG:i:0 AS:i:-1 XS:A:- d0:i:0
+UNC9-SN296_0254:7:1101:1482:32883#CGATGT 153 chr2 22809107 50 25M3406N75M * 0 0 <SEQ> <MAPQ> 
+NH:i:1 MD:Z:30C69 OM:i:1 XO:i:0 XM:i:1 i0:i:0 s0:i:0 OC:Z:25M3407N75M XG:i:0 AS:i:-1 XS:A:- d0:i:0
 ...
-UNC9-SN296_0254:7:1101:1483:94304#CGATGT 137 chr1 81336983 50 100M * 0 0 <SEQ> <MAPQ> NH:i:1 MD:Z:69A30 OM:i:1 XN:i:0 XO:i:0 XM:i:1 i0:i:0 s0:i:1 OC:Z:100M XG:i:0 AS:i:-1 YT:Z:UU d0:i:0
+UNC9-SN296_0254:7:1101:1483:94304#CGATGT 137 chr1 81336983 50 100M * 0 0 <SEQ> <MAPQ> 
+NH:i:1 MD:Z:69A30 OM:i:1 XN:i:0 XO:i:0 XM:i:1 i0:i:0 s0:i:1 OC:Z:100M XG:i:0 AS:i:-1 YT:Z:UU d0:i:0
 ...
 
 merged.bam:
 ...
-UNC9-SN296_0254:7:1101:1482:32883#CGATGT 153 chr2 22809107 50 25M3406N75M * 0 0 <SEQ> <MAPQ> NH:i:1 MD:Z:30C69 OM:i:1 XO:i:0 XM:i:1 i0:i:0 s0:i:0 OC:Z:25M3405N75M XG:i:0 AS:i:-1 XS:A:- d0:i:0 YA:A:3 ms:i:0 mi:i:0 md:i:0 ps:i:0 pi:i:0 pd:i:0 pc:Z:25M3407N75M pm:i:1 po:A:3 ct:A:U
+UNC9-SN296_0254:7:1101:1482:32883#CGATGT 153 chr2 22809107 50 25M3406N75M * 0 0 <SEQ> <MAPQ> 
+NH:i:1 MD:Z:30C69 OM:i:1 XO:i:0 XM:i:1 i0:i:0 s0:i:0 OC:Z:25M3405N75M XG:i:0 AS:i:-1 XS:A:- d0:i:0 
+YA:A:3 ms:i:0 mi:i:0 md:i:0 ps:i:0 pi:i:0 pd:i:0 pc:Z:25M3407N75M pm:i:1 po:A:3 ct:A:U
 ...
-UNC9-SN296_0254:7:1101:1483:94304#CGATGT 137 chr1 81336983 50 100M * 0 0 <SEQ> <MAPQ> NH:i:1 MD:Z:69A30 OM:i:1 XN:i:0 XO:i:0 XM:i:1 i0:i:0 s0:i:1 OC:Z:100M XG:i:0 AS:i:-1 YT:Z:UU d0:i:0 YA:A:3 ms:i:0 mi:i:0 md:i:0 ps:i:1 pi:i:0 pd:i:0 mc:Z:100M mm:i:2 po:A:2 ct:A:Q
+UNC9-SN296_0254:7:1101:1483:94304#CGATGT 137 chr1 81336983 50 100M * 0 0 <SEQ> <MAPQ> 
+NH:i:1 MD:Z:69A30 OM:i:1 XN:i:0 XO:i:0 XM:i:1 i0:i:0 s0:i:1 OC:Z:100M XG:i:0 AS:i:-1 YT:Z:UU d0:i:0 
+YA:A:3 ms:i:0 mi:i:0 md:i:0 ps:i:1 pi:i:0 pd:i:0 mc:Z:100M mm:i:2 po:A:2 ct:A:Q
 ...
 
 In the output, reads are merged if they are determined to be 'equal' based on a variety of filters.
@@ -147,17 +185,21 @@ ct : the Choice Type for this read, eg the filter that determined which read to 
 	'R' for random filter: chose a random possible alignment from a set of 'equal' alignments based on the previous filters
 	'K' for kept-all filter: keep all possible alignments from a set of 'equal' alignments based on the previous filters
 
-Lapels tags: These are carried through on the read used as the base in the merge, which can be found in the 'po' tag.  If this tag is '3', the maternal alignment is the base.
-OC : the old cigar in the alignment of the in silico genome
-OM : the old NM (edit distance to the in silico sequence)
-s0 : the number of observed SNP positions having the in silico alleles
-i0 : the number of bases in the observed insertions having in silico alleles
-d0 : the number of bases in the observed deletions having in silico alleles
+Lapels tags: These are carried through on the read used as the base in the merge, which can be found in the 'po' tag.  
+If this tag is '3', the maternal alignment is the base copy that's modified by the merged tags.
 
-Merged lapels tags: These are copied from the non-base read in the merge.  If the base is maternal, then the paternal versions of these tags are used and vice-versa.
-[ms, ps] : the number of observed SNP positions have the [mother's, father's] in silico alleles
-[mi, pi] : the number of bases in the observed insertions having the [mother's, father's] in silico alleles
-[md, pd] : the number of bases in the observed deletions having the [mother's, father's] in silico alleles
-[mc, pc] : the old cigar string in the alignment of the [mother's, father's] in silico genome
-[mm, pm] : the old NM tag (edit distance to the [mother's, father's] in silico sequence)
+	OC : the old cigar in the alignment of the in silico genome
+	OM : the old NM (edit distance to the in silico sequence)
+	s0 : the number of observed SNP positions having the in silico alleles
+	i0 : the number of bases in the observed insertions having in silico alleles
+	d0 : the number of bases in the observed deletions having in silico alleles
+
+Merged lapels tags: These are copied from the non-base read in the merge.  If the base is maternal, then the paternal 
+versions of these tags are used and vice-versa.
+
+	[ms, ps] : the number of observed SNP positions have the [mother's, father's] in silico alleles
+	[mi, pi] : the number of bases in the observed insertions having the [mother's, father's] in silico alleles
+	[md, pd] : the number of bases in the observed deletions having the [mother's, father's] in silico alleles
+	[mc, pc] : the old cigar string in the alignment of the [mother's, father's] in silico genome
+	[mm, pm] : the old NM tag (edit distance to the [mother's, father's] in silico sequence)
 
