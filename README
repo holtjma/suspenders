@@ -1,10 +1,12 @@
 Introduction
 ============
 
-Suspenders merges two alignments of the same reads to different in silico genomes which typically represent the 
-mother's and father's genomes.
+As of version 0.2.2, Suspenders merges multiple alignments of the same reads under different pretenses.  The 
+classic case is to two different in silico genomes which typically represent the mother's and father's genomes.
+However, this can be expanded to multiple alignments that take place with different alignment settings such as
+variations in gap length, mismatches allowed, etc.
 
-Two files are taken as input:
+For the classic case, two files are taken as input:
 	(1) a BAM file that contains the first alignment to the mother's in silico genome
 	(2) a BAM file that contains the second alignment to the father's in silico genome
 These two alignments must be pre-processed by Lapels before running Suspenders so they can be compared in the 
@@ -170,14 +172,11 @@ In the output, reads are merged if they are determined to be 'equal' based on a 
 Additionally, new tags have been added for each read to identify how the reads were merged:
 
 Major tags:
-YA : the alignment presence
-	'1' for mother only: there was no paternal alignment at this position
-	'2' for father only: there was no maternal alignment at this position
-	'3' for both present: there was both a maternal and paternal alignment at this position, though they are not necessarily 'equal' 
-po : the decided Parent of Origin
-	'1' for mother: either there was no paternal alignment at this position or the paternal alignment was different (cigar string, number of mismatches, etc)
-	'2' for father: either there was no maternal alignment at this position or the maternal alignment was different (cigar string, number of mismatches, etc)
-	'3' for can't tell: there are definitely maternal and paternal alignments and they have the same position, cigar string, and number of mismatches
+po : an integer flag set representing the Parent of Origin of this particular read.  If multiple inputs
+	 have identical positions, cigar strings, and number of mismatches, then we consider it to be an 
+	 identical alignment.  In this case, the bit for each input will be set.  For example, given three
+	 inputs and an identical read in the second and third input, our flag would be 0b110 which would be
+	 stored as integer value 6.
 ct : the Choice Type for this read, eg the filter that determined which read to save
 	'U' for unique filter: only one possible alignment available, so it was kept
 	'Q' for quality score filter: chose the possible alignment with the highest score (calculated using the Bowtie schema)
@@ -186,20 +185,11 @@ ct : the Choice Type for this read, eg the filter that determined which read to 
 	'K' for kept-all filter: keep all possible alignments from a set of 'equal' alignments based on the previous filters
 
 Lapels tags: These are carried through on the read used as the base in the merge, which can be found in the 'po' tag.  
-If this tag is '3', the maternal alignment is the base copy that's modified by the merged tags.
+If this alignment came from multiple inputs, then the earliest input is used as the base copy that's modified by 
+the merged tags.
 
 	OC : the old cigar in the alignment of the in silico genome
 	OM : the old NM (edit distance to the in silico sequence)
 	s0 : the number of observed SNP positions having the in silico alleles
 	i0 : the number of bases in the observed insertions having in silico alleles
 	d0 : the number of bases in the observed deletions having in silico alleles
-
-Merged lapels tags: These are copied from the non-base read in the merge.  If the base is maternal, then the paternal 
-versions of these tags are used and vice-versa.
-
-	[ms, ps] : the number of observed SNP positions have the [mother's, father's] in silico alleles
-	[mi, pi] : the number of bases in the observed insertions having the [mother's, father's] in silico alleles
-	[md, pd] : the number of bases in the observed deletions having the [mother's, father's] in silico alleles
-	[mc, pc] : the old cigar string in the alignment of the [mother's, father's] in silico genome
-	[mm, pm] : the old NM tag (edit distance to the [mother's, father's] in silico sequence)
-

@@ -20,8 +20,8 @@ from multiprocessing.managers import SyncManager
 import pylab
 
 DESC = "A merger of genome alignments."
-VERSION = '0.2.1'
-PKG_VERSION = '0.2.1'
+VERSION = '0.2.2'
+PKG_VERSION = '0.2.2'
 
 #constant flags from the sam specs
 MULTIPLE_SEGMENT_FLAG = 1 << 0 #0x01
@@ -30,6 +30,10 @@ SEGMENT_UNMAPPED_FLAG = 1 << 2#0x04
 OTHER_UNMAPPED_FLAG = 1 << 3#0x08
 FIRST_SEGMENT_FLAG = 1 << 6#0x40
 #SECOND_SEGMENT_FLAG = 1 << 7#0x80
+
+#input types
+LAPELS_INPUT = 0
+NO_LAPELS_INPUT = 1
 
 #mergerTypes
 RANDOM_MERGE = 0
@@ -81,19 +85,19 @@ P_DEL_TAG = 'pd'
 
 #constants for the clusters
 MAX_CLUSTER_SIZE = 100
+MAX_IDLE_COUNT = 10
 
 verbosity = False
 
 class MergeWorker(multiprocessing.Process):
     
-    def __init__(self, readsQueue, resultsQueue, isMaster, firstFilename, secondFilename, outputFilename, mergerType, isRandomFilter, outHeader,
-                 managerAddress, numProcs, workerID, max_queue_size, pileupDict, keepAll):
+    def __init__(self, readsQueue, resultsQueue, isMaster, inputFilenames, outputFilename, mergerType, isRandomFilter, outHeader,
+                 managerAddress, numProcs, workerID, max_queue_size, pileupDict, keepAll, inputType, mateAll):
         '''
         @param readsQueue - the shared queue where the master will place indicators for the workers to decide what they should process
         @param resultsQueue - the shared queue for storing statistics on the alignments from each worker
         @param isMaster - boolean, indicates if this process is the master or not
-        @param firstFilename - the first fn to be merged
-        @param secondFilename - the second fn to be merged
+        @param inputFilenames - the list of input filenames we plan to merge
         @param outputFilename - the overall output filename where the final merge will be, worker won't use this unless a single process scenario
         @param mergerType - union, quality, pileup are the types offered right now
         @param isRandomFilter - boolean determining whether we random or union at the end
@@ -106,24 +110,25 @@ class MergeWorker(multiprocessing.Process):
         multiprocessing.Process.__init__(self)
         
         #always get these stats
-        self.statistics = {'K':{'1':0,'2':0,'3':0},
-                           'U':{'1':0,'2':0,'3':0},
-                           'Q':{'1':0,'2':0,'3':0},
-                           'P':{'1':0,'2':0,'3':0},
-                           'R':{'1':0,'2':0,'3':0},
-                           'tot':{'1':0,'2':0,'3':0}}
+        cts = ['K', 'U', 'Q', 'P', 'R', 'tot']
+        self.statistics = {}
+        maxPO = 2**len(inputFilenames)
+        for ct in cts:
+            self.statistics[ct] = [0 for x in range(0, maxPO)]
+        
         self.percentageChoice = [0 for x in range(0, 101)]
         
         #save the inputs from the init
         self.readsQueue = readsQueue
         self.resultsQueue = resultsQueue
         self.isMaster = isMaster
-        self.firstFilename = firstFilename
-        self.secondFilename = secondFilename
+        self.inputFilenames = inputFilenames
         self.baseOutputFN = outputFilename
         self.outHeader = outHeader
         self.isRandomFilter = isRandomFilter
         self.keepAll = keepAll
+        self.inputType = inputType
+        self.mateAll = mateAll
         
         if numProcs > 1:
             self.outputFilename = outputFilename+'.tmp'+str(workerID)+'.bam'
@@ -138,6 +143,7 @@ class MergeWorker(multiprocessing.Process):
         self.numProcs = numProcs
         self.workerID = workerID
         self.maxQueueSize = max_queue_size
+        self.idleCount = 0
         
         if mergerType == UNION_MERGE:
             self.mergerType = UNION_MERGE
@@ -192,19 +198,22 @@ class MergeWorker(multiprocessing.Process):
         random.seed()
         #import pydevd;pydevd.settrace()
         #attempt to open both bam files for merging
-        firstFile = pysam.Samfile(self.firstFilename, 'rb')
-        secondFile = pysam.Samfile(self.secondFilename, 'rb')
+        #firstFile = pysam.Samfile(self.firstFilename, 'rb')
+        #secondFile = pysam.Samfile(self.secondFilename, 'rb')
+        files = []
+        for fn in self.inputFilenames:
+            files.append(pysam.Samfile(fn, 'rb'))
         
         #open the output file as well
-        self.outputFile = pysam.Samfile(self.outputFilename, 'wb', header=self.outHeader, referencenames=firstFile.references)
+        self.outputFile = pysam.Samfile(self.outputFilename, 'wb', header=self.outHeader, referencenames=files[0].references)
         
         if self.mergerType == PILEUP_MERGE:
             #this one stores pieces counted in the pileup
-            self.pileupTempFile = pysam.Samfile(self.pileupTempPrefix+'.bam', 'wb', template=firstFile)
+            self.pileupTempFile = pysam.Samfile(self.pileupTempPrefix+'.bam', 'wb', header=self.outHeader, references=files[0].references)
             
             #this one stores those to be resolved by pileup
             self.tempFN = self.outputFilename+'.pileup_tmp.bam'
-            self.tempFile = pysam.Samfile(self.tempFN, 'wb', template=firstFile)
+            self.tempFile = pysam.Samfile(self.tempFN, 'wb', header=self.outHeader, references=files[0].references)
         
         #start with no qname
         currentQname = None
@@ -213,6 +222,7 @@ class MergeWorker(multiprocessing.Process):
         clusterEnd = None
         
         #get the first read ID from each file
+        '''
         firstTell = firstFile.tell()
         firstRead = firstFile.next()
         firstQname = firstRead.qname
@@ -222,7 +232,25 @@ class MergeWorker(multiprocessing.Process):
         secondQname = secondRead.qname
         
         clusterStarts = [firstTell, secondTell]
+        '''
+        tells = []
+        currentReads = []
+        qnames = []
+        clusterStarts = []
+        readSets = []
+        for bam in files:
+            tells.append(bam.tell())
+            clusterStarts.append(bam.tell())
+            read = bam.next()
+            currentReads.append(read)
+            qnames.append(read.qname)
+            readSets.append([])
+            
+            #if we have no current qname or the one from this read is earlier, set it 
+            if currentQname == None or isQnameBefore(read.qname, currentQname):
+                currentQname = read.qname
         
+        '''
         #pick the 'lowest' or first qname
         if isQnameBefore(firstQname, secondQname):
             currentQname = firstQname
@@ -231,14 +259,16 @@ class MergeWorker(multiprocessing.Process):
         
         firstReads = []
         secondReads = []
+        '''
         
         #used for output and debugging purposes
         count = 0
         maxReads = None
         isMatch = True
+        readsRemain = True
         
         #while we have a read left to process OR if there are matched values from before, this needs to loop at least once more
-        while firstRead != None or secondRead != None or isMatch:
+        while readsRemain or isMatch:
             #used for breaking if we need to, strictly for debug purposes
             if maxReads != None and count > maxReads:
                 break
@@ -246,22 +276,31 @@ class MergeWorker(multiprocessing.Process):
             #default there is no match
             isMatch = False
             
-            #check if the first one has a match, if so increment it and get the next read
-            while firstQname == currentQname and firstQname != None:
-                #always append the read
-                firstReads.append(firstRead)
-                
-                #get the next one for analysis
-                try:
-                    firstTell = firstFile.tell()
-                    firstRead = firstFile.next()
-                    firstQname = firstRead.qname
-                except:
-                    firstRead = None
-                    firstQname = None
+            #iterate through all our inputs
+            for x in range(0, len(self.inputFilenames)):
+                #check if the first one has a match, if so increment it and get the next read
+                while qnames[x] == currentQname and qnames[x] != None:
+                    #always append the read
+                    readSets[x].append(currentReads[x])
                     
-                isMatch = True
-                
+                    #get the next one for analysis
+                    try:
+                        tells[x] = files[x].tell()
+                        currentReads[x] = files[x].next()
+                        qnames[x] = currentReads[x].qname
+                        
+                        #firstTell = firstFile.tell()
+                        #firstRead = firstFile.next()
+                        #firstQname = firstRead.qname
+                    except:
+                        currentReads[x] = None
+                        qnames[x] = None
+                        #firstRead = None
+                        #firstQname = None
+                        
+                    isMatch = True
+            
+            '''
             #check the second also and get the next read if needed
             while secondQname == currentQname and secondQname != None:
                 #always append the read
@@ -277,7 +316,8 @@ class MergeWorker(multiprocessing.Process):
                     secondQname = None
                     
                 isMatch = True
-                
+            '''
+            
             #check if there are no reads matching the current qname
             if not isMatch:
                 
@@ -290,7 +330,7 @@ class MergeWorker(multiprocessing.Process):
                 
                 if self.isSingleProcess:
                     #only a single process, us, handle it here
-                    self.handleSingleIdMerge(firstReads, secondReads)
+                    self.handleSingleIdMerge(readSets)
                 else:
                     #handling multi-process 
                     #if we have no start, make the start this name
@@ -312,12 +352,16 @@ class MergeWorker(multiprocessing.Process):
                                 pass
                             else:
                                 #cluster is full, BUT this wasn't added to the end
-                                self.handleSingleIdMerge(firstReads, secondReads)
+                                self.handleSingleIdMerge(readSets)
                         else:
                             #full cluster and space to submit, so do so
                             #self.readsQueue.put([clusterStart, clusterEnd])
                             self.readsQueue.put(clusterStarts)
-                            clusterStarts = [firstTell, secondTell]
+                            
+                            #clusterStarts = [firstTell, secondTell]
+                            clusterStarts = []
+                            for tell in tells:
+                                clusterStarts.append(tell)
                             
                             #there is space in the queue
                             if clusterEnd == currentQname:
@@ -327,7 +371,7 @@ class MergeWorker(multiprocessing.Process):
                                 clusterEnd = None
                                 currClusterSize = 0
                             else:
-                                self.handleSingleIdMerge(firstReads, secondReads)
+                                self.handleSingleIdMerge(readSets)
                                 
                                 clusterStart = None
                                 clusterEnd = None
@@ -340,15 +384,31 @@ class MergeWorker(multiprocessing.Process):
                                 currClusterSize = 1
                                 '''
                 #reset the pairing
-                firstReads = []
-                secondReads = []
-                
+                #firstReads = []
+                #secondReads = []
+                readSets = []
+                currentQname = None
+                for x in range(0, len(self.inputFilenames)):
+                    readSets.append([])
+                    
+                    #if we have no current qname or the one from this read is earlier, set it 
+                    if currentQname == None or (qnames[x] != None and isQnameBefore(qnames[x], currentQname)):
+                        currentQname = qnames[x]
+                        
+                '''
                 #get the next qname
                 if firstQname != None and (secondQname == None or isQnameBefore(firstQname, secondQname)):
                     currentQname = firstQname
                 else:
                     currentQname = secondQname
-        
+                '''
+            #check if we still have a read somewhere to go through
+            readsRemain = False
+            for r in currentReads:
+                if r != None:
+                    readsRemain = True
+                    break
+            
         if clusterStart != None:
             #remainder cluster, put it on 
             #self.readsQueue.put([clusterStart, clusterEnd])
@@ -370,13 +430,13 @@ class MergeWorker(multiprocessing.Process):
             self.prepareForPileup()
         
         #close the files
-        firstFile.close()
-        secondFile.close()
+        #firstFile.close()
+        #secondFile.close()
+        for bam in files:
+            bam.close()
         self.outputFile.close()
         
         logger.info('[0] Completed first pass')
-        
-        
         
         #self.resultsQueue.put(self.percentageChoice)
         
@@ -387,43 +447,47 @@ class MergeWorker(multiprocessing.Process):
         random.seed()
         
         #attempt to open both bam files for merging
-        firstFile = pysam.Samfile(self.firstFilename, 'rb')
-        secondFile = pysam.Samfile(self.secondFilename, 'rb')
-        self.outputFile = pysam.Samfile(self.outputFilename, 'wb', header=self.outHeader, referencenames=firstFile.references)
+        #firstFile = pysam.Samfile(self.firstFilename, 'rb')
+        #secondFile = pysam.Samfile(self.secondFilename, 'rb')
+        files = []
+        for fn in self.inputFilenames:
+            files.append(pysam.Samfile(fn, 'rb'))
+        self.outputFile = pysam.Samfile(self.outputFilename, 'wb', header=self.outHeader, referencenames=files[0].references)
         
-        firstRead = firstFile.next()
-        firstQname = firstRead.qname
+        #firstRead = firstFile.next()
+        #firstQname = firstRead.qname
         
-        secondRead = secondFile.next()
-        secondQname = secondRead.qname
+        #secondRead = secondFile.next()
+        #secondQname = secondRead.qname
         
         #open the temp pileup file if necessary
         if self.mergerType == PILEUP_MERGE:
             #this one stores pieces counted in the pileup
-            self.pileupTempFile = pysam.Samfile(self.pileupTempPrefix+'.bam', 'wb', template=firstFile)
+            self.pileupTempFile = pysam.Samfile(self.pileupTempPrefix+'.bam', 'wb', header=self.outHeader, referencenames=files[0].references)
             
             #this one stores those to be resolved by pileup
             self.tempFN = self.outputFilename+'.pileup_tmp.bam'
-            self.tempFile = pysam.Samfile(self.tempFN, 'wb', template=firstFile)
+            self.tempFile = pysam.Samfile(self.tempFN, 'wb', header=self.outHeader, referencenames=files[0].references)
             
         while self.stage == QUALITY_STAGE:
-            firstReads = None
-            secondReads = None
-            
             try:
-                qnames = self.readsQueue.get(True, 1)
-                
+                tellStarts = self.readsQueue.get(True, 1)
             except:
-                self.maxQueueSize.value += 10
-                logger.info('['+str(self.workerID)+'] Increasing queue size to '+str(self.maxQueueSize.value))
-                qnames = None
-            
-            if qnames == None:
+                #self.maxQueueSize.value += 10
+                #logger.info('['+str(self.workerID)+'] Increasing queue size to '+str(self.maxQueueSize.value))
+                self.idleCount += 1
+                logger.info('['+str(self.workerID)+'] Idle count: '+str(self.idleCount))
+                tellStarts = None
+                if self.idleCount >= MAX_IDLE_COUNT:
+                    logger.info('['+str(self.workerID)+'] Idle too often, terminating early')
+                    self.stage = PILEUP_STAGE
+                    
+            if tellStarts == None:
                 pass
-            elif qnames == END_OF_QUEUE:
+            elif tellStarts == END_OF_QUEUE:
                 self.stage = PILEUP_STAGE
             else:
-                
+                '''
                 #move to the relevant points in our files
                 firstFile.seek(qnames[0])
                 secondFile.seek(qnames[1])
@@ -450,58 +514,64 @@ class MergeWorker(multiprocessing.Process):
                     currentQname = firstQname
                 else:
                     currentQname = secondQname
-                
+                '''
+                currentReads = []
+                qnames = []
+                readSets = []
+                currentQname = None
+                for x in range(0, len(self.inputFilenames)):
+                    #move to the relevant point in the file
+                    files[x].seek(tellStarts[x])
+                    
+                    try:
+                        r = files[x].next()
+                        q = r.qname
+                        currentReads.append(r)
+                        qnames.append(q)
+                    except:
+                        currentReads.append(None)
+                        qnames.append(None)
+                    
+                    readSets.append([])
+                    
+                    #if we have no current qname or the one from this read is earlier, set it 
+                    if currentQname == None or (qnames[x] != None and isQnameBefore(qnames[x], currentQname)):
+                        currentQname = qnames[x]
+                    
                 numProcessed = 0
                 while currentQname != None and numProcessed < MAX_CLUSTER_SIZE:
-                    #each round through this loop is a new set of first and second reads
-                    firstReads = []
-                    secondReads = []
-                
-                    #get and save all reads equal to this
-                    while firstRead != None and firstQname == currentQname:
-                        firstReads.append(firstRead)
-                        try:
-                            firstRead = firstFile.next()
-                            firstQname = firstRead.qname
-                        except:
-                            firstRead = None
-                            firstQname = None
+                    for x in range(0, len(self.inputFilenames)):
+                        #each round through this loop is a new set of first and second reads
+                        readSets[x] = []
+                        
+                        #get and save all reads equal to this
+                        while currentReads[x] != None and qnames[x] == currentQname:
+                            readSets[x].append(currentReads[x])
+                            try:
+                                currentReads[x] = files[x].next()
+                                qnames[x] = currentReads[x].qname
+                            except:
+                                currentReads[x] = None
+                                qnames[x] = None
                     
-                    
-                    #get and save all reads equal to this
-                    while secondRead != None and secondQname == currentQname:
-                        secondReads.append(secondRead)
-                        try:
-                            secondRead = secondFile.next()
-                            secondQname = secondRead.qname
-                        except:
-                            secondRead = None
-                            secondQname = None
-                
                     #merge the two sets
-                    self.handleSingleIdMerge(firstReads, secondReads)
+                    self.handleSingleIdMerge(readSets)
                     numProcessed += 1
                     
                     #get the next qname
-                    if firstRead == None:
-                        currentQname = secondQname
-                    elif secondRead == None:
-                        currentQname = firstQname
-                    elif isQnameBefore(firstQname, secondQname):
-                        currentQname = firstQname
-                    else:
-                        currentQname = secondQname
+                    currentQname = None
+                    for x in range(0, len(self.inputFilenames)):
+                        #if we have no current qname or the one from this read is earlier, set it 
+                        if currentQname == None or (qnames[x] != None and isQnameBefore(qnames[x], currentQname)):
+                            currentQname = qnames[x]
         
-        
-        firstFile.close()
-        secondFile.close()
         
         #this handles the sorting and indexing of pileup files
         if self.mergerType == PILEUP_MERGE:
             self.prepareForPileup()
         
-        firstFile.close()
-        secondFile.close()
+        for bam in files:
+            bam.close()
         self.outputFile.close()
         
         logger.info('['+str(self.workerID)+'] Completed first pass')
@@ -509,30 +579,31 @@ class MergeWorker(multiprocessing.Process):
         #self.resultsQueue.put(self.statistics)
         #self.resultsQueue.put(self.percentageChoice)
         
-    def handleSingleIdMerge(self, firstReads, secondReads):
+    def handleSingleIdMerge(self, readSets):
         '''
         This function takes two sets of reads and attempts to pick one of the best alignments to save using region based likelihood
         @param firstReads - the set of reads coming from the first parent
         @param secondReads - the set of reads coming from the second parent
         '''
         if verbosity:
-            dumpReads(firstReads, secondReads)
+            dumpReads(readSets)
         
         #import pydevd;pydevd.settrace()
         
-        #pair the reads using their HI tags
-        [firstPairs, firstSingles] = pairReads(firstReads, 'HI')
-        [secondPairs, secondSingles] = pairReads(secondReads, 'HI')
-        
-        '''
-        #remove this later
-        if (len(firstPairs) > 0 and len(firstSingles) > 0) or (len(secondPairs) > 0 and len(secondSingles) > 0):
-            dumpReads(firstReads, secondReads)
-        '''
+        pairsList = []
+        singlesList = []
+        for reads in readSets:
+            #pair the reads using their HI tags
+            [p, s] = pairReads(reads, 'HI')
+            pairsList.append(p)
+            singlesList.append(s)
+            
+        #[firstPairs, firstSingles] = pairReads(firstReads, 'HI')
+        #[secondPairs, secondSingles] = pairReads(secondReads, 'HI')
         
         #combine reads but keep all of them regardless of score
-        possiblePairs = combinePairs(firstPairs, secondPairs)
-        possibleSingles = combineSingles(firstSingles, secondSingles)
+        possiblePairs = combinePairs(pairsList, self.inputType)
+        possibleSingles = combineSingles(singlesList, self.inputType)
         
         #stats re-done
         pairLen = len(possiblePairs)
@@ -589,60 +660,133 @@ class MergeWorker(multiprocessing.Process):
         else:
             #we now need to reduce the remaining reads based on quality
             #the following functions weed out lower quality reads
-            possiblePairs = reducePairsByScore(possiblePairs)
-            possibleSingles = reduceSinglesByScore(possibleSingles)
+            possiblePairs = reducePairsByScore(possiblePairs, self.inputType)
+            possibleSingles = reduceSinglesByScore(possibleSingles, self.inputType)
             
-            if len(possiblePairs) > 0:
-                #if there's only one possible pair remaining, then it's a quality based match
-                if len(possiblePairs) == 1:
-                    setTag(possiblePairs[0][0], CHOICE_TYPE_TAG, 'Q')
-                    setTag(possiblePairs[0][1], CHOICE_TYPE_TAG, 'Q')
-                    
-                    self.saveRead(possiblePairs[0][0])
-                    self.saveRead(possiblePairs[0][1])
-                    
-                    if self.mergerType == PILEUP_MERGE:
-                        self.parseReadForTree(possiblePairs[0][0])
-                        self.parseReadForTree(possiblePairs[0][1])
-                        
+            #if we chose to mateAll, we have some pairs, and we have individually aligned endpoints
+            if self.mateAll and len(possiblePairs) > 0 and len(possibleSingles) == 2:
+                pairScore = calculatePairScore(possiblePairs[0], self.inputType)
+                individualScore = calculateReadScore(possibleSingles[True][0], self.inputType)+calculateReadScore(possibleSingles[False][0], self.inputType)
+                
+                if pairScore < individualScore:
+                    #choose the indiv
+                    self.handleSingleSolution(possibleSingles)
                 else:
-                    if self.mergerType == RANDOM_MERGE:
-                        #we randomly choose a pair to keep if this is the case
-                        self.saveRandomPair(possiblePairs)
-                    
-                    elif self.mergerType == PILEUP_MERGE:
-                        #store all of the pairs remaining for sorting through later
-                        pHI = 0
-                        for pair in possiblePairs:
-                            setTag(pair[0], PILEUP_HI_TAG, pHI)
-                            setTag(pair[1], PILEUP_HI_TAG, pHI)
-                            self.tempFile.write(pair[0])
-                            self.tempFile.write(pair[1])
-                            pHI += 1
+                    #choose the pair
+                    self.handlePairSolution(possiblePairs)
+                
+            #else, normal analysis
             else:
-                #we randomly choose for each sequence a single alignment to keep
-                pHI = 0
-                for seq in possibleSingles:
-                    if len(possibleSingles[seq]) == 1:
-                        #only one option for this end of the read, save it
-                        setTag(possibleSingles[seq][0], CHOICE_TYPE_TAG, 'Q')
-                        self.saveRead(possibleSingles[seq][0])
+                if len(possiblePairs) > 0:
+                    self.handlePairSolution(possiblePairs)
+                    '''
+                    #if there's only one possible pair remaining, then it's a quality based match
+                    if len(possiblePairs) == 1:
+                        setTag(possiblePairs[0][0], CHOICE_TYPE_TAG, 'Q')
+                        setTag(possiblePairs[0][1], CHOICE_TYPE_TAG, 'Q')
                         
-                        #parse the read if it's a pileup merge
+                        self.saveRead(possiblePairs[0][0])
+                        self.saveRead(possiblePairs[0][1])
+                        
                         if self.mergerType == PILEUP_MERGE:
-                            self.parseReadForTree(possibleSingles[seq][0])
-                        
-                    elif len(possibleSingles[seq]) > 1:
-                        #multiple options for this end of the read
+                            self.parseReadForTree(possiblePairs[0][0])
+                            self.parseReadForTree(possiblePairs[0][1])
+                            
+                    else:
                         if self.mergerType == RANDOM_MERGE:
-                            #random merge, random save
-                            self.saveRandomSingle(possibleSingles[seq])
+                            #we randomly choose a pair to keep if this is the case
+                            self.saveRandomPair(possiblePairs)
+                        
                         elif self.mergerType == PILEUP_MERGE:
-                            #store these alignments for pileup checking later
-                            for single in possibleSingles[seq]:
-                                setTag(single, PILEUP_HI_TAG, pHI)
-                                self.tempFile.write(single)
+                            #store all of the pairs remaining for sorting through later
+                            pHI = 0
+                            for pair in possiblePairs:
+                                setTag(pair[0], PILEUP_HI_TAG, pHI)
+                                setTag(pair[1], PILEUP_HI_TAG, pHI)
+                                self.tempFile.write(pair[0])
+                                self.tempFile.write(pair[1])
                                 pHI += 1
+                    '''
+                else:
+                    self.handleSingleSolution(possibleSingles)
+                    '''
+                    #we randomly choose for each sequence a single alignment to keep
+                    pHI = 0
+                    for seq in possibleSingles:
+                        if len(possibleSingles[seq]) == 1:
+                            #only one option for this end of the read, save it
+                            setTag(possibleSingles[seq][0], CHOICE_TYPE_TAG, 'Q')
+                            self.saveRead(possibleSingles[seq][0])
+                            
+                            #parse the read if it's a pileup merge
+                            if self.mergerType == PILEUP_MERGE:
+                                self.parseReadForTree(possibleSingles[seq][0])
+                            
+                        elif len(possibleSingles[seq]) > 1:
+                            #multiple options for this end of the read
+                            if self.mergerType == RANDOM_MERGE:
+                                #random merge, random save
+                                self.saveRandomSingle(possibleSingles[seq])
+                            elif self.mergerType == PILEUP_MERGE:
+                                #store these alignments for pileup checking later
+                                for single in possibleSingles[seq]:
+                                    setTag(single, PILEUP_HI_TAG, pHI)
+                                    self.tempFile.write(single)
+                                    pHI += 1
+                    '''
+    
+    def handlePairSolution(self, possiblePairs):
+        #if there's only one possible pair remaining, then it's a quality based match
+        if len(possiblePairs) == 1:
+            setTag(possiblePairs[0][0], CHOICE_TYPE_TAG, 'Q')
+            setTag(possiblePairs[0][1], CHOICE_TYPE_TAG, 'Q')
+            
+            self.saveRead(possiblePairs[0][0])
+            self.saveRead(possiblePairs[0][1])
+            
+            if self.mergerType == PILEUP_MERGE:
+                self.parseReadForTree(possiblePairs[0][0])
+                self.parseReadForTree(possiblePairs[0][1])
+                
+        else:
+            if self.mergerType == RANDOM_MERGE:
+                #we randomly choose a pair to keep if this is the case
+                self.saveRandomPair(possiblePairs)
+            
+            elif self.mergerType == PILEUP_MERGE:
+                #store all of the pairs remaining for sorting through later
+                pHI = 0
+                for pair in possiblePairs:
+                    setTag(pair[0], PILEUP_HI_TAG, pHI)
+                    setTag(pair[1], PILEUP_HI_TAG, pHI)
+                    self.tempFile.write(pair[0])
+                    self.tempFile.write(pair[1])
+                    pHI += 1
+    
+    def handleSingleSolution(self, possibleSingles):
+        #we randomly choose for each sequence a single alignment to keep
+        pHI = 0
+        for seq in possibleSingles:
+            if len(possibleSingles[seq]) == 1:
+                #only one option for this end of the read, save it
+                setTag(possibleSingles[seq][0], CHOICE_TYPE_TAG, 'Q')
+                self.saveRead(possibleSingles[seq][0])
+                
+                #parse the read if it's a pileup merge
+                if self.mergerType == PILEUP_MERGE:
+                    self.parseReadForTree(possibleSingles[seq][0])
+                
+            elif len(possibleSingles[seq]) > 1:
+                #multiple options for this end of the read
+                if self.mergerType == RANDOM_MERGE:
+                    #random merge, random save
+                    self.saveRandomSingle(possibleSingles[seq])
+                elif self.mergerType == PILEUP_MERGE:
+                    #store these alignments for pileup checking later
+                    for single in possibleSingles[seq]:
+                        setTag(single, PILEUP_HI_TAG, pHI)
+                        self.tempFile.write(single)
+                        pHI += 1
     
     def prepareForPileup(self):
         '''
@@ -690,7 +834,7 @@ class MergeWorker(multiprocessing.Process):
         if parent == None or choice == None:
             logger.error('Missing parent and/or choice tags:'+str(readToSave))
         else:
-            if self.statistics.has_key(choice) and self.statistics[choice].has_key(parent):
+            if self.statistics.has_key(choice) and parent < len(self.statistics[choice]):
                 self.statistics[choice][parent] += 1
                 self.statistics['tot'][parent] += 1
             else:
@@ -773,31 +917,69 @@ def saveChoiceChart(data, fn, titleFn):
     logger.info('Chart data: '+str(data))
     logger.info('Chart saved to "'+fn+'".')
 
-def calculatePairScore(readPair):
+tupToCigarType = {0 : 'M',
+                  1 : 'I',
+                  2 : 'D',
+                  3 : 'N',
+                  4 : 'S',
+                  5 : 'H',
+                  6 : 'P',
+                  7 : '=',
+                  8 : 'X'}
+
+def constructCigarStrFromTuples(tups):
+    ret = ''
+    
+    for pair in tups:
+        ret += str(pair[1])
+        ret += tupToCigarType[pair[0]]
+        
+    return ret
+
+def calculatePairScore(readPair, inputType):
     '''
     @param readPair - the paired end read that needs a score calculated
     @return - the score associated with the paired end read
     '''
     #get the tags from the pair
-    oc1 = getTag(readPair[0], OLD_CIGAR_TAG)
-    oc2 = getTag(readPair[1], OLD_CIGAR_TAG)
-    
-    ed1 = getTag(readPair[0], 'OM')
-    ed2 = getTag(readPair[1], 'OM')
-
+    if inputType == LAPELS_INPUT:
+        oc1 = getTag(readPair[0], OLD_CIGAR_TAG)
+        oc2 = getTag(readPair[1], OLD_CIGAR_TAG)
+        
+        ed1 = getTag(readPair[0], 'OM')
+        ed2 = getTag(readPair[1], 'OM')
+    else:
+        oc1 = constructCigarStrFromTuples(readPair[0].cigar)
+        oc2 = constructCigarStrFromTuples(readPair[1].cigar)
+        
+        ed1 = getTag(readPair[0], 'NM')
+        ed2 = getTag(readPair[1], 'NM')
+        
+        if ed1 == None:
+            ed1 = 0
+        if ed2 == None:
+            ed2 = 0
+        
     #calculate and return the score
     score = calculateScore(oc1, ed1) + calculateScore(oc2, ed2)
     return score
 
-def calculateReadScore(read):
+def calculateReadScore(read, inputType):
     '''
     @param read - the unpaired read that needs a score calculated
     @return - the score for this unpaired read
     '''
     #get tags
-    oc = getTag(read, OLD_CIGAR_TAG)
-    ed = getTag(read, 'OM')
-
+    if inputType == LAPELS_INPUT:
+        oc = getTag(read, OLD_CIGAR_TAG)
+        ed = getTag(read, 'OM')
+    else:
+        oc = constructCigarStrFromTuples(read.cigar)
+        ed = getTag(read, 'NM')
+        
+        if ed == None:
+            ed = 0
+    
     #calculate the score
     score = calculateScore(oc, ed)
     return score
@@ -811,7 +993,7 @@ def calculateScore(cigar, editDistance):
     
     #make sure we have both values
     if cigar == None or editDistance == None:
-        return 0
+        return None
     
     #scoring constants as gathered from the bowtie website
     #TODO: make these user-configurable
@@ -900,20 +1082,17 @@ def setTag(read, tag, value):
     '''
     read.tags = read.tags + [(tag, value)]
     
-def dumpReads(firstReads, secondReads):
+def dumpReads(readSets):
     '''
     This function is mainly for debugging
     @param firstReads - the first set of reads
     @param secondReads - the second set of reads
     '''
     #old debug junk
-    print 'First:'+str(len(firstReads))
-    for read in firstReads:
-        print read
-    
-    print 'Second:'+str(len(secondReads))
-    for read in secondReads:
-        print read
+    for x in range(0, len(readSets)):
+        print str(x)+':'+str(len(readSets[x]))
+        for read in readSets[x]:
+            print read
         
     print
     
@@ -970,7 +1149,7 @@ def pairReads(reads, pairTag):
         print pairTag
         print readsLookup
         
-        dumpReads(reads, [])
+        dumpReads([reads])
         
         for tagValue in readsLookup:
             singles.append(readsLookup[tagValue])
@@ -978,7 +1157,7 @@ def pairReads(reads, pairTag):
     #return both lists
     return [pairs, singles]
 
-def combinePairs(pairs1, pairs2):
+def combinePairs(pairSets, inputType):
     '''
     @param pairs1 - the first set of pairs
     @param pairs2 - the second set of pairs
@@ -987,6 +1166,53 @@ def combinePairs(pairs1, pairs2):
     #unique pairs for potential saving
     uniquePairs = []
     
+    for x in range(0, len(pairSets)):
+        for p1 in pairSets[x]:
+            po = 2 ** x
+            
+            for y in range(x+1, len(pairSets)):
+                foundSame = False
+                for p2 in pairSets[y]:
+                    #get the original p2 and store it
+                    origP2 = p2
+                    
+                    #check if this pair is is the same position
+                    if isPositionSame(p1[0], p2[0]) and isPositionSame(p1[1], p2[1]):
+                        foundSame = True
+                    elif isPositionSame(p1[0], p2[1]) and isPositionSame(p1[1], p2[0]):
+                        foundSame = True
+                        
+                        #for this case, we need to swap them so they are in the same order when cigar strings are compared
+                        p2 = [p2[1], p2[0]]
+                    else:
+                        pass
+                    
+                    #break out if we get a match
+                    if foundSame:
+                        break
+                
+                if foundSame:
+                    #check scores and keep the best ones
+                    score1 = calculatePairScore(p1, inputType)
+                    score2 = calculatePairScore(p2, inputType)
+                    
+                    #if they are equal, we add this to our po
+                    if score1 == score2:
+                        po += 2 ** y
+                        pairSets[y].remove(origP2)
+                    else:
+                        #different scores, we'll count this as its own unit later in the loops
+                        pass
+            
+            #at this point our po value should be good to go
+            #set the PO tag
+            setTag(p1[0], PARENT_OF_ORIGIN_TAG, po)
+            setTag(p1[1], PARENT_OF_ORIGIN_TAG, po)
+            
+            #add the modified pair to our list
+            uniquePairs.append(p1)
+                    
+    '''
     #iterate through trying to match up pairs
     for p1 in pairs1:
         foundSame = False
@@ -1011,8 +1237,8 @@ def combinePairs(pairs1, pairs2):
         
         if foundSame:
             #check scores and keep the best ones
-            score1 = calculatePairScore(p1)
-            score2 = calculatePairScore(p2)
+            score1 = calculatePairScore(p1, inputType)
+            score2 = calculatePairScore(p2, inputType)
             
             #same position, therefor YA is 3
             setTag(p1[0], YA_TAG, '3')
@@ -1020,65 +1246,86 @@ def combinePairs(pairs1, pairs2):
             setTag(p2[0], YA_TAG, '3')
             setTag(p2[1], YA_TAG, '3')
             
-            #get the first pair's first end s0 tag
-            ms1 = getTag(p1[0], SNP_TAG)
-            mi1 = getTag(p1[0], INSERTION_TAG)
-            md1 = getTag(p1[0], DELETION_TAG)
-            setTag(p1[0], M_SNP_TAG, ms1)
-            setTag(p2[0], M_SNP_TAG, ms1)
-            setTag(p1[0], M_IN_TAG, mi1)
-            setTag(p2[0], M_IN_TAG, mi1)
-            setTag(p1[0], M_DEL_TAG, md1)
-            setTag(p2[0], M_DEL_TAG, md1)
+            if inputType == LAPELS_INPUT:
+                #get the first pair's first end s0 tag
+                ms1 = getTag(p1[0], SNP_TAG)
+                mi1 = getTag(p1[0], INSERTION_TAG)
+                md1 = getTag(p1[0], DELETION_TAG)
+                setTag(p1[0], M_SNP_TAG, ms1)
+                setTag(p2[0], M_SNP_TAG, ms1)
+                setTag(p1[0], M_IN_TAG, mi1)
+                setTag(p2[0], M_IN_TAG, mi1)
+                setTag(p1[0], M_DEL_TAG, md1)
+                setTag(p2[0], M_DEL_TAG, md1)
+                
+                #get the first pair's second end s0 tag
+                ms2 = getTag(p1[1], SNP_TAG)
+                mi2 = getTag(p1[1], INSERTION_TAG)
+                md2 = getTag(p1[1], DELETION_TAG)
+                setTag(p1[1], M_SNP_TAG, ms2)
+                setTag(p2[1], M_SNP_TAG, ms2)
+                setTag(p1[1], M_IN_TAG, mi2)
+                setTag(p2[1], M_IN_TAG, mi2)
+                setTag(p1[1], M_DEL_TAG, md2)
+                setTag(p2[1], M_DEL_TAG, md2)
+                
+                #get the second pair's first end s0 tag
+                ps1 = getTag(p2[0], SNP_TAG)
+                pi1 = getTag(p2[0], INSERTION_TAG)
+                pd1 = getTag(p2[0], DELETION_TAG)
+                setTag(p1[0], P_SNP_TAG, ps1)
+                setTag(p2[0], P_SNP_TAG, ps1)
+                setTag(p1[0], P_IN_TAG, pi1)
+                setTag(p2[0], P_IN_TAG, pi1)
+                setTag(p1[0], P_DEL_TAG, pd1)
+                setTag(p2[0], P_DEL_TAG, pd1)
+                
+                #get the second pair's second end s0 tag
+                ps2 = getTag(p2[1], SNP_TAG)
+                pi2 = getTag(p2[1], INSERTION_TAG)
+                pd2 = getTag(p2[1], DELETION_TAG)
+                setTag(p1[1], P_SNP_TAG, ps2)
+                setTag(p2[1], P_SNP_TAG, ps2)
+                setTag(p1[1], P_IN_TAG, pi2)
+                setTag(p2[1], P_IN_TAG, pi2)
+                setTag(p1[1], P_DEL_TAG, pd2)
+                setTag(p2[1], P_DEL_TAG, pd2)
+                
+                #if cigars are different, save the second
+                oc1 = getTag(p1[0], OLD_CIGAR_TAG)
+                oc2 = getTag(p2[0], OLD_CIGAR_TAG)
+                om1 = getTag(p1[0], OLD_MISMATCH_TAG)
+                om2 = getTag(p2[0], OLD_MISMATCH_TAG)
+            else:
+                oc1 = constructCigarStrFromTuples(p1[0].cigar)
+                oc2 = constructCigarStrFromTuples(p2[0].cigar)
+                om1 = getTag(p1[0], 'NM')
+                if om1 == None:
+                    om1 = 0
+                om2 = getTag(p2[0], 'NM')
+                if om2 == None:
+                    om2 = 0
             
-            #get the first pair's second end s0 tag
-            ms2 = getTag(p1[1], SNP_TAG)
-            mi2 = getTag(p1[1], INSERTION_TAG)
-            md2 = getTag(p1[1], DELETION_TAG)
-            setTag(p1[1], M_SNP_TAG, ms2)
-            setTag(p2[1], M_SNP_TAG, ms2)
-            setTag(p1[1], M_IN_TAG, mi2)
-            setTag(p2[1], M_IN_TAG, mi2)
-            setTag(p1[1], M_DEL_TAG, md2)
-            setTag(p2[1], M_DEL_TAG, md2)
-            
-            #get the second pair's first end s0 tag
-            ps1 = getTag(p2[0], SNP_TAG)
-            pi1 = getTag(p2[0], INSERTION_TAG)
-            pd1 = getTag(p2[0], DELETION_TAG)
-            setTag(p1[0], P_SNP_TAG, ps1)
-            setTag(p2[0], P_SNP_TAG, ps1)
-            setTag(p1[0], P_IN_TAG, pi1)
-            setTag(p2[0], P_IN_TAG, pi1)
-            setTag(p1[0], P_DEL_TAG, pd1)
-            setTag(p2[0], P_DEL_TAG, pd1)
-            
-            #get the second pair's second end s0 tag
-            ps2 = getTag(p2[1], SNP_TAG)
-            pi2 = getTag(p2[1], INSERTION_TAG)
-            pd2 = getTag(p2[1], DELETION_TAG)
-            setTag(p1[1], P_SNP_TAG, ps2)
-            setTag(p2[1], P_SNP_TAG, ps2)
-            setTag(p1[1], P_IN_TAG, pi2)
-            setTag(p2[1], P_IN_TAG, pi2)
-            setTag(p1[1], P_DEL_TAG, pd2)
-            setTag(p2[1], P_DEL_TAG, pd2)
-            
-            #if cigars are different, save the second
-            oc1 = getTag(p1[0], OLD_CIGAR_TAG)
-            oc2 = getTag(p2[0], OLD_CIGAR_TAG)
-            om1 = getTag(p1[0], OLD_MISMATCH_TAG)
-            om2 = getTag(p2[0], OLD_MISMATCH_TAG)
             if oc1 != oc2 or om1 != om2:
                 setTag(p1[0], P_CIGAR_TAG, oc2)
                 setTag(p1[0], P_MISMATCH_TAG, om2)
                 setTag(p2[0], M_CIGAR_TAG, oc1)
                 setTag(p2[0], M_MISMATCH_TAG, om1)
-                
-            oc1 = getTag(p1[1], OLD_CIGAR_TAG)
-            oc2 = getTag(p2[1], OLD_CIGAR_TAG)
-            om1 = getTag(p1[1], OLD_MISMATCH_TAG)
-            om2 = getTag(p2[1], OLD_MISMATCH_TAG)
+            
+            if inputType == LAPELS_INPUT:
+                oc1 = getTag(p1[1], OLD_CIGAR_TAG)
+                oc2 = getTag(p2[1], OLD_CIGAR_TAG)
+                om1 = getTag(p1[1], OLD_MISMATCH_TAG)
+                om2 = getTag(p2[1], OLD_MISMATCH_TAG)
+            else:
+                oc1 = constructCigarStrFromTuples(p1[1].cigar)
+                oc2 = constructCigarStrFromTuples(p2[1].cigar)
+                om1 = getTag(p1[1], 'NM')
+                if om1 == None:
+                    om1 = 0
+                om2 = getTag(p2[1], 'NM')
+                if om2 == None:
+                    om2 = 0
             if oc1 != oc2 or om1 != om2:
                 setTag(p1[1], P_CIGAR_TAG, oc2)
                 setTag(p1[1], P_MISMATCH_TAG, om2)
@@ -1123,11 +1370,12 @@ def combinePairs(pairs1, pairs2):
         setTag(p2[0], YA_TAG, '2')
         setTag(p2[1], YA_TAG, '2')
         uniquePairs.append(p2)
-    
+    '''
+                    
     #at this point uniquePairs contains each unique pair and the FC has been set if necessary
     return uniquePairs
     
-def combineSingles(singles1, singles2):
+def combineSingles(singleSets, inputType):
     '''
     @param singles1 - the list of unpaired alignments from the first parent
     @param singles2 - the list of unpaired alignments from the second parent
@@ -1136,6 +1384,42 @@ def combineSingles(singles1, singles2):
     #init scoring
     uniqueSingles = {}
     
+    for x in range(0, len(singleSets)):
+        for s1 in singleSets[x]:
+            po = 2 ** x
+            
+            for y in range(x+1, len(singleSets)):
+                foundSame = False
+                for s2 in singleSets[y]:
+                    #check if this pair is is the same position
+                    if isPositionSame(s1, s2):
+                        foundSame = True
+                        break
+                
+                if foundSame:
+                    #check scores and keep the best ones
+                    score1 = calculateReadScore(s1, inputType)
+                    score2 = calculateReadScore(s2, inputType)
+                    
+                    #if they are equal, we add this to our po
+                    if score1 == score2:
+                        po += 2 ** y
+                        singleSets[y].remove(s2)
+                    else:
+                        #different scores, we'll count this as its own unit later in the loops
+                        pass
+            
+            #at this point our po value should be good to go
+            #set the PO tag
+            setTag(s1, PARENT_OF_ORIGIN_TAG, po)
+            
+            #figure out which end it is
+            isFirstSegment = isFlagSet(s1.flag, FIRST_SEGMENT_FLAG)
+            if not uniqueSingles.has_key(isFirstSegment):
+                uniqueSingles[isFirstSegment] = []
+            uniqueSingles[isFirstSegment].append(s1)
+    
+    '''
     #now we loop through trying to pair up the singles
     for s1 in singles1:
         foundSame = False
@@ -1149,38 +1433,50 @@ def combineSingles(singles1, singles2):
         
         if foundSame:
             #check scores and keep the best ones
-            score1 = calculateReadScore(s1)
-            score2 = calculateReadScore(s2)
+            score1 = calculateReadScore(s1, inputType)
+            score2 = calculateReadScore(s2, inputType)
             
             #YA tag is 3
             setTag(s1, YA_TAG, '3')
             setTag(s2, YA_TAG, '3')
             
-            ms = getTag(s1, SNP_TAG)
-            mi = getTag(s1, INSERTION_TAG)
-            md = getTag(s1, DELETION_TAG)
-            setTag(s1, M_SNP_TAG, ms)
-            setTag(s2, M_SNP_TAG, ms)
-            setTag(s1, M_IN_TAG, mi)
-            setTag(s2, M_IN_TAG, mi)
-            setTag(s1, M_DEL_TAG, md)
-            setTag(s2, M_DEL_TAG, md)
+            if inputType == LAPELS_INPUT:
+                ms = getTag(s1, SNP_TAG)
+                mi = getTag(s1, INSERTION_TAG)
+                md = getTag(s1, DELETION_TAG)
+                setTag(s1, M_SNP_TAG, ms)
+                setTag(s2, M_SNP_TAG, ms)
+                setTag(s1, M_IN_TAG, mi)
+                setTag(s2, M_IN_TAG, mi)
+                setTag(s1, M_DEL_TAG, md)
+                setTag(s2, M_DEL_TAG, md)
+                
+                ps = getTag(s2, SNP_TAG)
+                pi = getTag(s2, INSERTION_TAG)
+                pd = getTag(s2, DELETION_TAG)
+                setTag(s1, P_SNP_TAG, ps)
+                setTag(s2, P_SNP_TAG, ps)
+                setTag(s1, P_IN_TAG, pi)
+                setTag(s2, P_IN_TAG, pi)
+                setTag(s1, P_DEL_TAG, pd)
+                setTag(s2, P_DEL_TAG, pd)
             
-            ps = getTag(s2, SNP_TAG)
-            pi = getTag(s2, INSERTION_TAG)
-            pd = getTag(s2, DELETION_TAG)
-            setTag(s1, P_SNP_TAG, ps)
-            setTag(s2, P_SNP_TAG, ps)
-            setTag(s1, P_IN_TAG, pi)
-            setTag(s2, P_IN_TAG, pi)
-            setTag(s1, P_DEL_TAG, pd)
-            setTag(s2, P_DEL_TAG, pd)
-            
-            #if cigars are different, save the second
-            oc1 = getTag(s1, OLD_CIGAR_TAG)
-            oc2 = getTag(s2, OLD_CIGAR_TAG)
-            om1 = getTag(s1, OLD_MISMATCH_TAG)
-            om2 = getTag(s2, OLD_MISMATCH_TAG)
+                #if cigars are different, save the second
+                oc1 = getTag(s1, OLD_CIGAR_TAG)
+                oc2 = getTag(s2, OLD_CIGAR_TAG)
+                om1 = getTag(s1, OLD_MISMATCH_TAG)
+                om2 = getTag(s2, OLD_MISMATCH_TAG)
+                
+            else:
+                oc1 = constructCigarStrFromTuples(s1.cigar)
+                oc2 = constructCigarStrFromTuples(s2.cigar)
+                om1 = getTag(s1, 'NM')
+                if om1 == None:
+                    om1 = 0
+                om2 = getTag(s2, 'NM')
+                if om2 == None:
+                    om2 = 0
+                    
             if oc1 != oc2 or om1 != om2:
                 setTag(s1, P_CIGAR_TAG, oc2)
                 setTag(s1, P_MISMATCH_TAG, om2)
@@ -1231,10 +1527,10 @@ def combineSingles(singles1, singles2):
         setTag(s2, PARENT_OF_ORIGIN_TAG, '2')
         setTag(s2, YA_TAG, '2')
         uniqueSingles[isFirstSegment].append(s2)
-    
+    '''
     return uniqueSingles
     
-def reducePairsByScore(pairs):
+def reducePairsByScore(pairs, inputType):
     '''
     Iterate through a list of paired-end reads and only return those with the highest scores
     @param pairs - the pairs to scan
@@ -1243,7 +1539,7 @@ def reducePairsByScore(pairs):
     bestScore = None
     bestPairs = []
     for pair in pairs:
-        score = calculatePairScore(pair)
+        score = calculatePairScore(pair, inputType)
         if bestScore == None or score > bestScore:
             bestScore = score
             bestPairs = []
@@ -1254,7 +1550,7 @@ def reducePairsByScore(pairs):
     #after the above loops, we have the best score between all detected pairs in either alignment
     return bestPairs
 
-def reduceSinglesByScore(singles):
+def reduceSinglesByScore(singles, inputType):
     '''
     Iterate through a list of single-end reads and only return those with the highest scores
     @param singles - the list of single-end reads to scan
@@ -1265,7 +1561,7 @@ def reduceSinglesByScore(singles):
         bests = []
         
         for single in singles[seq]:
-            score = calculateReadScore(single)
+            score = calculateReadScore(single, inputType)
             if bestScore == None or score > bestScore:
                 bestScore = score
                 bests = []
@@ -1416,49 +1712,48 @@ def initLogger():
 def getLogger():
     return logging.getLogger('root')
 
-def performInputChecks(fn1, fn2):
-    bam1 = pysam.Samfile(fn1, 'rb')
-    bam2 = pysam.Samfile(fn2, 'rb')
+def performInputChecks(fnList):
+    retHeader = None
     
-    retHeader = dict(bam1.header.items())
-    h2 = dict(bam2.header.items())
+    for fn in fnList:
+        bam = pysam.Samfile(fn, 'rb')
     
-    if retHeader['HD']['SO'] != 'query_name':
-        logger.error('File "'+fn1+'" is not sorted by name.')
-        return None
-    
-    if h2['HD']['SO'] != 'query_name':
-        logger.error('File "'+fn2+'" is not sorted by name.')
-        return None
-    
-    #first combine the header if h2 has a header to combine with
-    if h2.has_key('PG'):
-        #set h2 to different keys before combining
-        for pg in h2['PG']:
-            pg['ID'] = pg['ID'] + ' #2'
-            if pg.has_key('PP'):
-                pg['PP'] = pg['PP'] + ' #2'
-                
-        if retHeader.has_key('PG'):
-            #finally combine them
-            retHeader['PG'] = h2['PG'] + retHeader['PG']
-            
-        else:
-            #no data was in the original PG, so copy the one from h2
-            retHeader['PG'] = h2['PG']
-    
+        currentHeader = dict(bam.header.items())
+        if currentHeader['HD']['SO'] != 'query_name':
+            logger.warning('File "'+fn+'" SO tag indicates not sorted by query_name.')
         
+        if retHeader == None:
+            #first file, copy header
+            retHeader = dict(bam.header.items())
+        else:
+            #first combine the header if h2 has a header to combine with
+            if currentHeader.has_key('PG'):
+                #set h2 to different keys before combining
+                for pg in currentHeader['PG']:
+                    pg['ID'] = pg['ID'] + ' #2'
+                    if pg.has_key('PP'):
+                        pg['PP'] = pg['PP'] + ' #2'
+                        
+                if retHeader.has_key('PG'):
+                    #finally combine them
+                    retHeader['PG'] = currentHeader['PG'] + retHeader['PG']
+                    
+                else:
+                    #no data was in the original PG, so copy the one from h2
+                    retHeader['PG'] = currentHeader['PG']
+        
+        bam.close()
+    
     #now try adding my header so final result should be suspenders, h2, h1
     try:
         retHeader['PG'] = [{'ID': 'Suspenders', 'VN': PKG_VERSION,
-                            'PP': retHeader['PG'][0]['ID'],
                             'CL': ' '.join(sys.argv)}] + retHeader['PG']
     except KeyError:
         retHeader['PG'] = [{'ID': 'Suspenders', 'VN': PKG_VERSION,
                             'CL': ' '.join(sys.argv)}]
-    bam1.close()
-    bam2.close()
     
+    #make sure we mark sorted by name
+    retHeader['HD']['SO'] = 'query_name'
     return retHeader
 
 def mainRun():
@@ -1471,6 +1766,10 @@ def mainRun():
     #version data
     p.add_argument('-V', '--version', action='version', version='%(prog)s' + \
                    ' %s in Suspenders %s' % (VERSION, PKG_VERSION))
+    
+    group3 = p.add_mutually_exclusive_group()
+    group3.add_argument('-l', '--lapels', dest='inputType', action='store_const', const=LAPELS_INPUT, help='the input has lapels tags (default)', default=LAPELS_INPUT)
+    group3.add_argument('-n', '--normal-input', dest='inputType', action='store_const', const=NO_LAPELS_INPUT, help='the input doesn\'t have lapels tags', default=LAPELS_INPUT)
     
     group = p.add_mutually_exclusive_group()
     group.add_argument('-u', '--union', dest='mergeType', action='store_const', const=UNION_MERGE, help='merge the files using the union filter', default=RANDOM_MERGE)
@@ -1491,10 +1790,11 @@ def mainRun():
     
     p.add_argument('-e', '--keep-temp', dest='keepTemp', action='store_true', help='keep the temporary merge files', default=False)
     
+    p.add_argument('-m', '--mate-all', dest='mateAll', action='store_true', help='compare unmated segments to mated ones', default=False)
+    
     #required main arguments
-    p.add_argument('motherSortedBam', type=util.readableFile, help='the bam file of the sorted by name alignment to the mother pseudogenome')
-    p.add_argument('fatherSortedBam', type=util.readableFile, help='the bam file of the sorted by name alignment to the father pseudogenome')
     p.add_argument('outMergedBam', type=util.writableFile, help='the output bam file merged and sorted by name')
+    p.add_argument('inputBams', nargs='+', type=util.readableFile, help='the input bam files (sorted by read name) to be merged')
     
     #parse the arguments
     args = p.parse_args()
@@ -1521,17 +1821,24 @@ def mainRun():
             ft += 'Random'
         else:
             ft += 'Kept-All'
+            
+    if args.inputType == LAPELS_INPUT:
+        it = 'Lapels Input'
+    elif args.inputType == NO_LAPELS_INPUT:
+        it = 'Non-Lapels Input'
+    else:
+        it = 'ERROR: Unknown'
 
     logger.info('Merge Type:'+mt)
     logger.info('Filter Type: '+ft)
-    logger.info('Mother: '+args.motherSortedBam)
-    logger.info('Father: '+args.fatherSortedBam)
+    logger.info('Input Type: '+it)
+    logger.info('Inputs: '+str(args.inputBams))
     logger.info('Output: '+args.outMergedBam)
     logger.info('Number of processes: '+str(args.numProcesses))
     if args.keepTemp:
         logger.info('Keep temporary files: True')
     
-    outHeader = performInputChecks(args.motherSortedBam, args.fatherSortedBam)
+    outHeader = performInputChecks(args.inputBams)
     if outHeader == None:
         #there was an error reported, end program
         return
@@ -1557,14 +1864,14 @@ def mainRun():
         #create any extra workers
         workerThreads = []
         for i in range(1, args.numProcesses):
-            p = MergeWorker(readsQueue, resultsQueue, False, args.motherSortedBam, args.fatherSortedBam, args.outMergedBam, args.mergeType, args.isRandomFilter, outHeader, 
-                            manager.address, args.numProcesses, i, max_queue_size, myPileupDict, args.keepTemp)
+            p = MergeWorker(readsQueue, resultsQueue, False, args.inputBams, args.outMergedBam, args.mergeType, args.isRandomFilter, outHeader, 
+                            manager.address, args.numProcesses, i, max_queue_size, myPileupDict, args.keepTemp, args.inputType, args.mateAll)
             p.start()
             workerThreads.append(p)
         
         #create the master
-        masterProcess = MergeWorker(readsQueue, resultsQueue, True, args.motherSortedBam, args.fatherSortedBam, args.outMergedBam, args.mergeType, args.isRandomFilter, outHeader, 
-                                    manager.address, args.numProcesses, 0, max_queue_size, myPileupDict, args.keepTemp)
+        masterProcess = MergeWorker(readsQueue, resultsQueue, True, args.inputBams, args.outMergedBam, args.mergeType, args.isRandomFilter, outHeader, 
+                                    manager.address, args.numProcesses, 0, max_queue_size, myPileupDict, args.keepTemp, args.inputType, args.mateAll)
         masterProcess.start()
         
         masterProcess.join()
@@ -1598,7 +1905,7 @@ def mainRun():
     
         #create the pileup stuff using pools
         #in queue a bunch of chromosome names, sorted descending
-        firstFile = pysam.Samfile(args.motherSortedBam)
+        firstFile = pysam.Samfile(args.inputBams[0])
         sqHead = firstFile.header['SQ']
         sqHead = sorted(sqHead, key=lambda k: k['LN'], reverse=True)
         firstFile.close()
@@ -1670,12 +1977,12 @@ def mainRun():
             #we try to merge something with an empty file
             for i in range(0, args.numProcesses):
                 totVals = filenameToResults[args.outMergedBam+'.tmp'+str(i)+'.bam']['tot']
-                if totVals['1'] > 0 or totVals['2'] > 0 or totVals['3'] > 0:
+                if sum(totVals) > 0:#totVals['1'] > 0 or totVals['2'] > 0 or totVals['3'] > 0:
                     mergeArgs.append(args.outMergedBam+'.tmp'+str(i)+'.bam')
                 
                 if args.mergeType == PILEUP_MERGE:
                     totVals = filenameToResults[args.outMergedBam+'.tmp'+str(i)+'.bam.pileup_complete.bam']['tot']
-                    if totVals['1'] > 0 or totVals['2'] > 0 or totVals['3'] > 0:
+                    if sum(totVals) > 0:#totVals['1'] > 0 or totVals['2'] > 0 or totVals['3'] > 0:
                         mergeArgs.append(args.outMergedBam+'.tmp'+str(i)+'.bam.pileup_complete.bam')
             
             #print mergeArgs
@@ -1707,6 +2014,8 @@ def mainRun():
         if args.chartFilename != None and args.mergeType == PILEUP_MERGE:
             sumData = [sum(a) for a in zip(*res)]
             saveChoiceChart(sumData, args.chartFilename, args.outMergedBam)
-        
+    
+    #TODO: should we join the manager? aka is it killing itself appropriately?
+    
 if __name__ == '__main__':
     mainRun()
