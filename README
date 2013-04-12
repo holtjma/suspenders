@@ -183,13 +183,3 @@ ct : the Choice Type for this read, eg the filter that determined which read to 
 	'P' for pileup height filter: chose the possible alignment with the highest pileup height
 	'R' for random filter: chose a random possible alignment from a set of 'equal' alignments based on the previous filters
 	'K' for kept-all filter: keep all possible alignments from a set of 'equal' alignments based on the previous filters
-
-Lapels tags: These are carried through on the read used as the base in the merge, which can be found in the 'po' tag.  
-If this alignment came from multiple inputs, then the earliest input is used as the base copy that's modified by 
-the merged tags.
-
-	OC : the old cigar in the alignment of the in silico genome
-	OM : the old NM (edit distance to the in silico sequence)
-	s0 : the number of observed SNP positions having the in silico alleles
-	i0 : the number of bases in the observed insertions having in silico alleles
-	d0 : the number of bases in the observed deletions having in silico alleles
