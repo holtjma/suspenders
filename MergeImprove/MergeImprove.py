@@ -20,8 +20,8 @@ from multiprocessing.managers import SyncManager
 import pylab
 
 DESC = "A merger of genome alignments."
-VERSION = '0.2.2'
-PKG_VERSION = '0.2.2'
+VERSION = '0.2.3'
+PKG_VERSION = '0.2.3'
 
 #constant flags from the sam specs
 MULTIPLE_SEGMENT_FLAG = 1 << 0 #0x01
@@ -1829,7 +1829,7 @@ def mainRun():
     else:
         it = 'ERROR: Unknown'
 
-    logger.info('Merge Type:'+mt)
+    logger.info('Merge Type: '+mt)
     logger.info('Filter Type: '+ft)
     logger.info('Input Type: '+it)
     logger.info('Inputs: '+str(args.inputBams))
@@ -2009,6 +2009,11 @@ def mainRun():
                         except:
                             logger.info('Failed to remove '+args.outMergedBam+'.tmp'+str(i)+'.bam.pileup_complete.bam from the file system.')
         
+        else:
+            #if we get here then we have 1 process, and it's not a pileup process
+            #we need to rename the file
+            os.rename(args.outMergedBam+'.tmp0.bam', args.outMergedBam)
+            
         logger.info('Merge complete!')
         
         if args.chartFilename != None and args.mergeType == PILEUP_MERGE:
