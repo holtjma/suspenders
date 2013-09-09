@@ -13,10 +13,12 @@ These two alignments must be pre-processed by Lapels before running Suspenders s
 same reference coordinates system.  Additionally, both input files need to be sorted by read name (as opposed 
 to coordinates).
 
+For more information on Suspenders, refer to "Read Annotation Pipeline for High-Throughput Sequencing Data" by
+James Holt and Shunping Huang et al.
+
 For detailed usage, please type after installation:
 
 	pysuspenders -h
-
 
 System Requirements
 ===================
