@@ -20,8 +20,8 @@ from multiprocessing.managers import SyncManager
 import pylab
 
 DESC = "A merger of genome alignments."
-VERSION = '0.2.3'
-PKG_VERSION = '0.2.3'
+VERSION = '0.2.4'
+PKG_VERSION = '0.2.4'
 
 #constant flags from the sam specs
 MULTIPLE_SEGMENT_FLAG = 1 << 0 #0x01
