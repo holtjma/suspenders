@@ -1715,7 +1715,7 @@ def getLogger():
 def performInputChecks(fnList):
     retHeader = None
     
-    for fn in fnList:
+    for i, fn in enumerate(fnList):
         bam = pysam.Samfile(fn, 'rb')
     
         currentHeader = dict(bam.header.items())
@@ -1730,9 +1730,9 @@ def performInputChecks(fnList):
             if currentHeader.has_key('PG'):
                 #set h2 to different keys before combining
                 for pg in currentHeader['PG']:
-                    pg['ID'] = pg['ID'] + ' #2'
+                    pg['ID'] = pg['ID'] + ' #'+str(i+1)
                     if pg.has_key('PP'):
-                        pg['PP'] = pg['PP'] + ' #2'
+                        pg['PP'] = pg['PP'] + ' #'+str(i+1)
                         
                 if retHeader.has_key('PG'):
                     #finally combine them
