@@ -20,8 +20,8 @@ from multiprocessing.managers import SyncManager
 import pylab
 
 DESC = "A merger of genome alignments."
-VERSION = '0.2.4'
-PKG_VERSION = '0.2.4'
+VERSION = '0.2.5'
+PKG_VERSION = '0.2.5'
 
 #constant flags from the sam specs
 MULTIPLE_SEGMENT_FLAG = 1 << 0 #0x01
@@ -209,11 +209,11 @@ class MergeWorker(multiprocessing.Process):
         
         if self.mergerType == PILEUP_MERGE:
             #this one stores pieces counted in the pileup
-            self.pileupTempFile = pysam.Samfile(self.pileupTempPrefix+'.bam', 'wb', header=self.outHeader, references=files[0].references)
+            self.pileupTempFile = pysam.Samfile(self.pileupTempPrefix+'.bam', 'wb', header=self.outHeader, referencenames=files[0].references)
             
             #this one stores those to be resolved by pileup
             self.tempFN = self.outputFilename+'.pileup_tmp.bam'
-            self.tempFile = pysam.Samfile(self.tempFN, 'wb', header=self.outHeader, references=files[0].references)
+            self.tempFile = pysam.Samfile(self.tempFN, 'wb', header=self.outHeader, referencenames=files[0].references)
         
         #start with no qname
         currentQname = None
@@ -1112,7 +1112,7 @@ def pairReads(reads, pairTag):
     for read in reads:
         if isFlagSet(read.flag, MULTIPLE_SEGMENT_FLAG):
             #if isFlagSet(read.flag, BOTH_ALIGNED_FLAG):
-            if not isFlagSet(read.flag, OTHER_UNMAPPED_FLAG):
+            if not isFlagSet(read.flag, OTHER_UNMAPPED_FLAG) and not isFlagSet(read.flag, SEGMENT_UNMAPPED_FLAG):
                 #this is a read that is paired and both ends aligned
                 #get the hiTag
                 hiTag = getTag(read, pairTag)
@@ -1675,24 +1675,33 @@ def isPositionSame(read1, read2):
         return False
     
     #finally, compare
-    #if read1.seq == read2.seq and read1.rname == read2.rname and read1.pos == read2.pos:
-    #same segment, same chrom, same pos
-    if isFlagSet(read1.flag, FIRST_SEGMENT_FLAG) == isFlagSet(read2.flag, FIRST_SEGMENT_FLAG) and read1.rname == read2.rname and read1.pos == read2.pos:
-        #now check the cigars
-        cig1 = read1.cigar
-        cig2 = read2.cigar
-        
-        #go through each position in the cigar
-        for cigLoc in range(0, len(cig1)):
-            if cig1[cigLoc][0] == cig2[cigLoc][0] and cig1[cigLoc][1] == cig2[cigLoc][1]:
-                #same type and same position, we're still fine
-                pass
-            else:
-                #different type or position, return false
-                return False
-        
-        #all values matched, good to go
-        return True
+    if isFlagSet(read1.flag, FIRST_SEGMENT_FLAG) == isFlagSet(read2.flag, FIRST_SEGMENT_FLAG):
+        #if both are unmapped, then true
+        if isFlagSet(read1.flag, SEGMENT_UNMAPPED_FLAG) and isFlagSet(read2.flag, SEGMENT_UNMAPPED_FLAG):
+            return True
+        #if one is unmapped, then false
+        elif isFlagSet(read1.flag, SEGMENT_UNMAPPED_FLAG) or isFlagSet(read2.flag, SEGMENT_UNMAPPED_FLAG):
+            return False
+        #check for same chrom, same pos
+        elif (read1.rname == read2.rname and read1.pos == read2.pos):
+            #now check the cigars
+            cig1 = read1.cigar
+            cig2 = read2.cigar
+            
+            #go through each position in the cigar
+            for cigLoc in range(0, len(cig1)):
+                if cig1[cigLoc][0] == cig2[cigLoc][0] and cig1[cigLoc][1] == cig2[cigLoc][1]:
+                    #same type and same position, we're still fine
+                    pass
+                else:
+                    #different type or position, return false
+                    return False
+            
+            #all values matched, good to go
+            return True
+        #different chrom and/or position
+        else:
+            return False
     else:
         return False
 
@@ -1937,7 +1946,7 @@ def mainRun():
             
             for x in range(0, args.numProcesses):
                 #create more pileup files that we can merge in
-                pw = Pileup.PileupWorker(sharedDict, resultsQueue, args.outMergedBam, args.isRandomFilter, outHeader, x, args.keepTemp)
+                pw = Pileup.PileupWorker(sharedDict, resultsQueue, args.outMergedBam, args.isRandomFilter, outHeader, x, args.keepTemp, len(args.inputBams))
                 pw.start()
                 pws.append(pw)
             

@@ -1,7 +1,7 @@
 from setuptools import setup
 
 setup(name='suspenders',
-      version='0.2.4',
+      version='0.2.5',
       description='Allows the merging of alignments that have been annotated using pylapels into a single alignment that picks the highest quality alignment.',
       url='http://code.google.com/p/suspenders',
       author='James Holt',

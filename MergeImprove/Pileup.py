@@ -12,7 +12,7 @@ import os
 import random
 
 class PileupWorker(multiprocessing.Process):
-    def __init__(self, sharedDict, resultsQueue, outputFilename, isRandomFilter, outHeader, workerID, keepAll):
+    def __init__(self, sharedDict, resultsQueue, outputFilename, isRandomFilter, outHeader, workerID, keepAll, numInputs):
         '''
         @param sharedDict - a dictionary full of multiprocessing.Arrays
         @param resultsQueue - the shared queue for storing statistics on the alignments from each worker
@@ -31,12 +31,20 @@ class PileupWorker(multiprocessing.Process):
         self.sharedDict = sharedDict
         
         #always get these stats
+        '''
         self.statistics = {'K':{'1':0,'2':0,'3':0},
                            'U':{'1':0,'2':0,'3':0},
                            'Q':{'1':0,'2':0,'3':0},
                            'P':{'1':0,'2':0,'3':0},
                            'R':{'1':0,'2':0,'3':0},
                            'tot':{'1':0,'2':0,'3':0}}
+        '''
+        cts = ['K', 'U', 'Q', 'P', 'R', 'tot']
+        self.statistics = {}
+        maxPO = 2**numInputs
+        for ct in cts:
+            self.statistics[ct] = [0 for x in range(0, maxPO)]
+        
         self.percentageChoice = [0 for x in range(0, 101)]
         
         #save the inputs from the init
@@ -272,11 +280,12 @@ class PileupWorker(multiprocessing.Process):
         if parent == None or choice == None:
             print 'ERROR:'+str(readToSave)
         else:
-            if self.statistics.has_key(choice) and self.statistics[choice].has_key(parent):
+            if self.statistics.has_key(choice) and parent < len(self.statistics[choice]):
                 self.statistics[choice][parent] += 1
                 self.statistics['tot'][parent] += 1
             else:
                 print 'Poorly structured tag:'
+                print self.statistics
                 print readToSave
             
         if MergeImprove.verbosity:
