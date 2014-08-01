@@ -135,7 +135,7 @@ Examples can be downloaded from
 
 To run on the example files, navigate to the examples folder and run:
 
-	pysuspenders -t ./mother.bam ./father.bam ./merged.bam
+	pysuspenders -t ./merged.bam ./mother.bam ./father.bam
 
 The following are snippets of the content in the input and output BAM file in the examples (gathered using 
 'samtools view merged.bam').
