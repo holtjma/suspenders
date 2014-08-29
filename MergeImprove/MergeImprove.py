@@ -20,8 +20,8 @@ from multiprocessing.managers import SyncManager
 import pylab
 
 DESC = "A merger of genome alignments."
-VERSION = '0.2.5'
-PKG_VERSION = '0.2.5'
+VERSION = '0.2.6'
+PKG_VERSION = '0.2.6'
 
 #constant flags from the sam specs
 MULTIPLE_SEGMENT_FLAG = 1 << 0 #0x01
@@ -203,6 +203,7 @@ class MergeWorker(multiprocessing.Process):
         files = []
         for fn in self.inputFilenames:
             files.append(pysam.Samfile(fn, 'rb'))
+        self.sams = files
         
         #open the output file as well
         self.outputFile = pysam.Samfile(self.outputFilename, 'wb', header=self.outHeader, referencenames=files[0].references)
@@ -602,8 +603,8 @@ class MergeWorker(multiprocessing.Process):
         #[secondPairs, secondSingles] = pairReads(secondReads, 'HI')
         
         #combine reads but keep all of them regardless of score
-        possiblePairs = combinePairs(pairsList, self.inputType)
-        possibleSingles = combineSingles(singlesList, self.inputType)
+        possiblePairs = combinePairs(pairsList, self.inputType, self.sams)
+        possibleSingles = combineSingles(singlesList, self.inputType, self.sams)
         
         #stats re-done
         pairLen = len(possiblePairs)
@@ -1157,7 +1158,7 @@ def pairReads(reads, pairTag):
     #return both lists
     return [pairs, singles]
 
-def combinePairs(pairSets, inputType):
+def combinePairs(pairSets, inputType, sams):
     '''
     @param pairs1 - the first set of pairs
     @param pairs2 - the second set of pairs
@@ -1177,9 +1178,9 @@ def combinePairs(pairSets, inputType):
                     origP2 = p2
                     
                     #check if this pair is is the same position
-                    if isPositionSame(p1[0], p2[0]) and isPositionSame(p1[1], p2[1]):
+                    if isPositionSame(p1[0], p2[0], sams[x], sams[y]) and isPositionSame(p1[1], p2[1], sams[x], sams[y]):
                         foundSame = True
-                    elif isPositionSame(p1[0], p2[1]) and isPositionSame(p1[1], p2[0]):
+                    elif isPositionSame(p1[0], p2[1], sams[x], sams[y]) and isPositionSame(p1[1], p2[0], sams[x], sams[y]):
                         foundSame = True
                         
                         #for this case, we need to swap them so they are in the same order when cigar strings are compared
@@ -1375,7 +1376,7 @@ def combinePairs(pairSets, inputType):
     #at this point uniquePairs contains each unique pair and the FC has been set if necessary
     return uniquePairs
     
-def combineSingles(singleSets, inputType):
+def combineSingles(singleSets, inputType, sams):
     '''
     @param singles1 - the list of unpaired alignments from the first parent
     @param singles2 - the list of unpaired alignments from the second parent
@@ -1392,7 +1393,7 @@ def combineSingles(singleSets, inputType):
                 foundSame = False
                 for s2 in singleSets[y]:
                     #check if this pair is is the same position
-                    if isPositionSame(s1, s2):
+                    if isPositionSame(s1, s2, sams[x], sams[y]):
                         foundSame = True
                         break
                 
@@ -1659,7 +1660,7 @@ def isQnameBefore(qname1, qname2):
     #print ret
     return ret
 
-def isPositionSame(read1, read2):
+def isPositionSame(read1, read2, sam1, sam2):
     '''
     @param read1 - the first read to check
     @param read2 - the second read to check
@@ -1683,7 +1684,7 @@ def isPositionSame(read1, read2):
         elif isFlagSet(read1.flag, SEGMENT_UNMAPPED_FLAG) or isFlagSet(read2.flag, SEGMENT_UNMAPPED_FLAG):
             return False
         #check for same chrom, same pos
-        elif (read1.rname == read2.rname and read1.pos == read2.pos):
+        elif (sam1.getrname(read1.rname) == sam2.getrname(read2.rname) and read1.pos == read2.pos):
             #now check the cigars
             cig1 = read1.cigar
             cig2 = read2.cigar
