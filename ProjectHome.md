@@ -1,0 +1,1 @@
+Suspenders merges two BAM files that have been aligned to pseudo-genomes and annotated using Lapels.  There are two functioning merge types (union and quality) along with a third merge type (pileup) thats still in development.
