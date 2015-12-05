@@ -17,7 +17,7 @@ import re
 import multiprocessing
 from multiprocessing.managers import SyncManager
 
-import pylab
+#import pylab
 
 DESC = "A merger of genome alignments."
 VERSION = '0.2.6'
@@ -2028,6 +2028,7 @@ def mainRun():
         
         if args.chartFilename != None and args.mergeType == PILEUP_MERGE:
             sumData = [sum(a) for a in zip(*res)]
+            import pylab
             saveChoiceChart(sumData, args.chartFilename, args.outMergedBam)
     
     #TODO: should we join the manager? aka is it killing itself appropriately?
