@@ -141,6 +141,8 @@ class PileupWorker(multiprocessing.Process):
             for pair in pairs:
                 [tot1, bases1] = self.calcPileupStats(pair[0])
                 [tot2, bases2] = self.calcPileupStats(pair[1])
+                if bases1+bases2 == 0:
+                    bases1 = 1
                 
                 avgPileup = float(tot1+tot2)/(bases1+bases2)
                 avgSum += avgPileup
@@ -181,6 +183,8 @@ class PileupWorker(multiprocessing.Process):
                 
                 #get the pileup calculation
                 [tot, bases] = self.calcPileupStats(read)
+                if bases == 0:
+                    bases = 1
                 avgPileup = float(tot)/bases
                 avgSum[isFirst] += avgPileup
                 
